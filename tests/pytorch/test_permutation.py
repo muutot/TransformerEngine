@@ -25,9 +25,10 @@ from transformer_engine.pytorch import (
     Float8BlockQuantizer,
     MXFP8Quantizer,
 )
-import transformer_engine_torch as tex
 from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
 import copy
+
+from utils import assert_close
 
 seed = 1234
 torch.manual_seed(seed)
@@ -191,19 +192,19 @@ def pytorch_sort_chunks_by_index(
     return output
 
 
-def dtype_tols(te_dtype: tex.DType) -> Dict[str, float]:
+def dtype_tols(te_dtype: te.DType) -> Dict[str, float]:
     """Estimated tolerances for a datatype
 
     Based on tolerances for torch.testing.assert_close.
 
     """
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         return dict(rtol=1.0e-6, atol=1.0e-6)
-    if te_dtype == tex.DType.kFloat16:
+    if te_dtype == te.DType.kFloat16:
         return dict(rtol=3.0e-3, atol=1.0e-5)
-    if te_dtype == tex.DType.kBFloat16:
+    if te_dtype == te.DType.kBFloat16:
         return dict(rtol=2.0e-2, atol=1.0e-5)
-    if te_dtype == tex.DType.kFloat8E5M2 or te_dtype == tex.DType.kFloat8E4M3:
+    if te_dtype == te.DType.kFloat8E5M2 or te_dtype == te.DType.kFloat8E4M3:
         return dict(rtol=2.0e-1, atol=1.0e-1)
     raise ValueError(f"Unsuppored dtype ({te_dtype})")
 
@@ -255,11 +256,11 @@ def _test_permutation_index_map(
     )
 
     # Convert TE dtypes to PyTorch dtypes
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         dtype = torch.float32
-    elif te_dtype == tex.DType.kFloat16:
+    elif te_dtype == te.DType.kFloat16:
         dtype = torch.float16
-    elif te_dtype == tex.DType.kBFloat16:
+    elif te_dtype == te.DType.kBFloat16:
         dtype = torch.bfloat16
     else:
         pytest.skip("Invalid dtype.")
@@ -476,11 +477,11 @@ def _test_permutation_mask_map(
     )
 
     # Convert TE dtypes to PyTorch dtypes
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         dtype = torch.float32
-    elif te_dtype == tex.DType.kFloat16:
+    elif te_dtype == te.DType.kFloat16:
         dtype = torch.float16
-    elif te_dtype == tex.DType.kBFloat16:
+    elif te_dtype == te.DType.kBFloat16:
         dtype = torch.bfloat16
     else:
         pytest.skip("Invalid dtype.")
@@ -704,11 +705,11 @@ def _test_permutation_and_padding_mask_map(
     )
 
     # Convert TE dtypes to PyTorch dtypes
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         dtype = torch.float32
-    elif te_dtype == tex.DType.kFloat16:
+    elif te_dtype == te.DType.kFloat16:
         dtype = torch.float16
-    elif te_dtype == tex.DType.kBFloat16:
+    elif te_dtype == te.DType.kBFloat16:
         dtype = torch.bfloat16
     else:
         pytest.skip("Invalid dtype.")
@@ -1000,11 +1001,11 @@ def _test_permutation_and_padding_with_merging_probs(
     )
 
     # Convert TE dtypes to PyTorch dtypes
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         dtype = torch.float32
-    elif te_dtype == tex.DType.kFloat16:
+    elif te_dtype == te.DType.kFloat16:
         dtype = torch.float16
-    elif te_dtype == tex.DType.kBFloat16:
+    elif te_dtype == te.DType.kBFloat16:
         dtype = torch.bfloat16
     else:
         pytest.skip("Invalid dtype.")
@@ -1327,11 +1328,11 @@ def _test_moe_chunk_sort(
     )
 
     # Convert TE dtypes to PyTorch dtypes
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         dtype = torch.float32
-    elif te_dtype == tex.DType.kFloat16:
+    elif te_dtype == te.DType.kFloat16:
         dtype = torch.float16
-    elif te_dtype == tex.DType.kBFloat16:
+    elif te_dtype == te.DType.kBFloat16:
         dtype = torch.bfloat16
     else:
         pytest.skip("Invalid dtype.")
@@ -1462,11 +1463,11 @@ def _test_permutation_mask_map_alongside_probs(
     )
 
     # Convert TE dtypes to PyTorch dtypes
-    if te_dtype == tex.DType.kFloat32:
+    if te_dtype == te.DType.kFloat32:
         dtype = torch.float32
-    elif te_dtype == tex.DType.kFloat16:
+    elif te_dtype == te.DType.kFloat16:
         dtype = torch.float16
-    elif te_dtype == tex.DType.kBFloat16:
+    elif te_dtype == te.DType.kBFloat16:
         dtype = torch.bfloat16
     else:
         pytest.skip("Invalid dtype.")
@@ -1667,9 +1668,9 @@ def perf_test_cuda_kernel(cuda_kernel_fn):
 
 
 # TE tensor dtypes
-_te_dtypes: List[tex.DType] = [tex.DType.kFloat32, tex.DType.kFloat16]
+_te_dtypes: List[te.DType] = [te.DType.kFloat32, te.DType.kFloat16]
 if te.is_bf16_available():
-    _te_dtypes.append(tex.DType.kBFloat16)
+    _te_dtypes.append(te.DType.kBFloat16)
 
 
 @pytest.mark.parametrize("te_dtype", _te_dtypes)
@@ -1700,6 +1701,25 @@ def test_permutation_index_map(
         hidden_size=hidden_size,
         topK=topK,
         num_out_tokens=num_out_tokens,
+        with_probs=with_probs,
+        BENCHMARK=BENCHMARK,
+        use_torch_compile=use_torch_compile,
+    )
+
+
+@pytest.mark.parametrize("te_dtype", _te_dtypes)
+@pytest.mark.parametrize("use_torch_compile", [False, True])
+def test_permutation_index_map_empty_input(te_dtype, use_torch_compile):
+    with_probs = True
+    BENCHMARK = False
+
+    _test_permutation_index_map(
+        te_dtype=te_dtype,
+        num_tokens=0,
+        num_expert=8,
+        hidden_size=4096,
+        topK=2,
+        num_out_tokens=0,
         with_probs=with_probs,
         BENCHMARK=BENCHMARK,
         use_torch_compile=use_torch_compile,
@@ -1738,6 +1758,45 @@ def test_permutation_mask_map(
         BENCHMARK=BENCHMARK,
         use_torch_compile=use_torch_compile,
     )
+
+
+@pytest.mark.parametrize("torch_dtype", [torch.float32, torch.float16, torch.bfloat16])
+# 4096 tokens span several 1024-token blocks of the row-map kernels
+@pytest.mark.parametrize("num_tokens", [64, 4096])
+def test_permutation_mask_map_capacity_drop(torch_dtype, num_tokens):
+    """num_out_tokens smaller than routing_map.sum(): over-capacity entries must be
+    dropped (as the CUDA index-map path does), not written past the output buffer."""
+    num_expert, hidden_size = 8, 128
+    torch.manual_seed(1234)
+
+    routing_map = (torch.rand(num_tokens, num_expert) > 0.5).bool().cuda()
+    total_routed = int(routing_map.sum())
+    capacity = total_routed - 17
+    assert capacity > 0
+
+    inp = torch.randn((num_tokens, hidden_size)).cuda().to(torch_dtype)
+
+    out, row_id_map = te_permute(inp, routing_map, num_out_tokens=capacity, map_type="mask")
+
+    # reference: expert-major order of routed (expert, token) pairs, first
+    # `capacity` destination rows kept
+    token_idx = torch.nonzero(routing_map.T.contiguous(), as_tuple=False)[:, 1]
+    ref = inp[token_idx[:capacity]]
+    assert out.shape[0] == capacity
+    torch.testing.assert_close(out.float(), ref.float(), atol=0, rtol=0)
+
+    # the row map must mark exactly the over-capacity entries as dropped
+    n_routed = row_id_map[:, 2 * num_expert]
+    assert int(n_routed.sum()) == capacity
+
+    # unpermute consumes the same map: each token gets the sum of its kept copies
+    unperm = te_unpermute(out, row_id_map, restore_shape=inp.shape, map_type="mask")
+    kept_flat = torch.zeros(num_expert * num_tokens, dtype=torch.bool, device=inp.device)
+    routed_flat_idx = torch.nonzero(routing_map.T.contiguous().flatten(), as_tuple=False)[:, 0]
+    kept_flat[routed_flat_idx[:capacity]] = True
+    kept_map = kept_flat.view(num_expert, num_tokens).T.contiguous()
+    ref_unperm = (inp.float().unsqueeze(1) * kept_map.unsqueeze(-1).float()).sum(1)
+    assert_close(unperm, ref_unperm)
 
 
 @pytest.mark.parametrize("te_dtype", _te_dtypes)
@@ -1899,7 +1958,7 @@ fp8_recipes = [
 
 
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
-@pytest.mark.parametrize("te_dtype", [tex.DType.kFloat8E4M3, tex.DType.kFloat8E5M2])
+@pytest.mark.parametrize("te_dtype", [te.DType.kFloat8E4M3, te.DType.kFloat8E5M2])
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("num_expert", [7, 16])
 @pytest.mark.parametrize("hidden_size", [4096])
@@ -2048,9 +2107,9 @@ def test_chunk_permutation_empty_input(te_dtype, use_torch_compile):
 def test_permutation_single_case():
     print("GPU:", torch.cuda.get_device_name(0))
 
-    # te_dtype = tex.DType.kFloat32
-    # te_dtype = tex.DType.kFloat16
-    te_dtype = tex.DType.kBFloat16
+    # te_dtype = te.DType.kFloat32
+    # te_dtype = te.DType.kFloat16
+    te_dtype = te.DType.kBFloat16
 
     num_tokens = 12
     num_expert = 4
@@ -2216,9 +2275,9 @@ def test_benchmark_multiple_cases():
     """Benchmark test - skipped by default. Run with: RUN_BENCHMARK_TESTS=1 pytest -k benchmark"""
     print("GPU:", torch.cuda.get_device_name(0))
 
-    # te_dtype = tex.DType.kFloat32
-    # te_dtype = tex.DType.kFloat16
-    te_dtype = tex.DType.kBFloat16
+    # te_dtype = te.DType.kFloat32
+    # te_dtype = te.DType.kFloat16
+    te_dtype = te.DType.kBFloat16
 
     ep_size = 64
     tp_size = 2

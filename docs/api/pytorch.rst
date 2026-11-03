@@ -6,7 +6,7 @@
 PyTorch
 =======
 
-.. autoapiclass:: transformer_engine.pytorch.Linear(in_features, out_features, bias=True, **kwargs)
+.. autoapiclass:: transformer_engine.pytorch.Linear(in_features, out_features, **kwargs)
   :members: forward, set_tensor_parallel_group
 
 .. autoapiclass:: transformer_engine.pytorch.GroupedLinear(in_features, out_features, bias=True, **kwargs)
@@ -25,6 +25,18 @@ PyTorch
 .. autoapiclass:: transformer_engine.pytorch.DotProductAttention(num_attention_heads, kv_channels, **kwargs)
   :members: forward, set_context_parallel_group
 
+.. autoapiclass:: transformer_engine.pytorch.GatedDeltaNetAttention(num_attention_heads, kv_channels, **kwargs)
+  :members: forward
+
+.. autoapiclass:: transformer_engine.pytorch.GatedDeltaNet2Attention(num_attention_heads, kv_channels, **kwargs)
+  :members: forward
+
+.. autoapiclass:: transformer_engine.pytorch.GatedDeltaProductAttention(num_attention_heads, kv_channels, num_householder=1, **kwargs)
+  :members: forward
+
+.. autoapiclass:: transformer_engine.pytorch.KimiDeltaAttention(num_attention_heads, kv_channels, **kwargs)
+  :members: forward
+
 .. autoapiclass:: transformer_engine.pytorch.MultiheadAttention(hidden_size, num_attention_heads, **kwargs)
   :members: forward, set_context_parallel_group, set_tensor_parallel_group
 
@@ -38,7 +50,7 @@ PyTorch
   :members: reset, get_states, set_states, add, fork
 
 
-.. autoapifunction:: transformer_engine.pytorch.autocast
+.. autoapiclass:: transformer_engine.pytorch.autocast(enabled=True, calibrating=False, recipe=None, amax_reduction_group=None)
 
 .. autoapifunction:: transformer_engine.pytorch.quantized_model_init
 
@@ -54,6 +66,16 @@ PyTorch
 .. autoapiclass:: transformer_engine.pytorch.ManualOffloadSynchronizer
 
 .. autoapifunction:: transformer_engine.pytorch.parallel_cross_entropy
+
+.. autoapifunction:: transformer_engine.pytorch.interleave_glu_tensor
+
+.. autoapifunction:: transformer_engine.pytorch.deinterleave_glu_tensor
+
+Data types
+----------
+
+.. autoapiclass:: transformer_engine.pytorch.DType()
+  :members: kByte, kInt32, kFloat32, kFloat16, kBFloat16, kFloat8E4M3, kFloat8E5M2, kFloat4E2M1
 
 Recipe availability
 -------------------
@@ -77,15 +99,54 @@ Recipe availability
 Mixture of Experts (MoE) functions
 ----------------------------------
 
+See :doc:`Mixture of Experts <../features/mixture_of_experts/mixture_of_experts>` for an overview of
+how these functions fit together. ``GroupedLinear`` (the grouped GEMM used for the
+expert layers) is documented above with the other modules.
+
 .. autoapifunction:: transformer_engine.pytorch.moe_permute
 
 .. autoapifunction:: transformer_engine.pytorch.moe_permute_with_probs
+
+.. autoapifunction:: transformer_engine.pytorch.moe_permute_and_pad_with_probs
 
 .. autoapifunction:: transformer_engine.pytorch.moe_unpermute
 
 .. autoapifunction:: transformer_engine.pytorch.moe_sort_chunks_by_index
 
 .. autoapifunction:: transformer_engine.pytorch.moe_sort_chunks_by_index_with_probs
+
+.. autoapifunction:: transformer_engine.pytorch.router.fused_topk_with_score_function
+
+.. autoapifunction:: transformer_engine.pytorch.router.fused_compute_score_for_moe_aux_loss
+
+.. autoapifunction:: transformer_engine.pytorch.router.fused_moe_aux_loss
+
+Expert parallelism
+~~~~~~~~~~~~~~~~~~
+
+NCCL-based dispatch and combine for experts sharded across ranks. See
+:doc:`Expert parallelism <../features/mixture_of_experts/mixture_of_experts>`.
+
+``MoeDispatch`` and ``MoeCombine`` can wrap the local expert operations in a
+``transformer_engine.pytorch.ops.Sequential``. They share an ``EpConfig`` and
+an ``EpBuffer``; the guide shows how to connect the per-expert counts and
+routing weights through the sequence's extra-tensor channels.
+
+.. autoapiclass:: transformer_engine.pytorch.ops.MoeDispatch
+
+.. autoapiclass:: transformer_engine.pytorch.ops.MoeCombine
+
+.. autoapiclass:: transformer_engine.pytorch.ep.EpConfig
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_bootstrap
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_finalize
+
+.. autoapiclass:: transformer_engine.pytorch.ep.EpBuffer
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_dispatch
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_combine
 
 
 Communication-computation overlap
@@ -97,6 +158,12 @@ Communication-computation overlap
 
 .. autoapiclass:: transformer_engine.pytorch.UserBufferQuantizationMode
   :members: FP8, NONE
+
+
+Fine-grained quantization recipes
+---------------------------------
+
+.. autoapiclass:: transformer_engine.pytorch.QuantizerRole(module_type="", tensor_type="", name="")
 
 
 Quantized tensors
@@ -116,6 +183,10 @@ Quantized tensors
 
 .. autoapiclass:: transformer_engine.pytorch.NVFP4TensorStorage(rowwise_data, rowwise_scale_inv, columnwise_data, columnwise_scale_inv, amax_rowwise, amax_columnwise, fp4_dtype, quantizer)
 
+.. autoapiclass:: transformer_engine.pytorch.HybridQuantizedTensorStorage(*, rowwise_storage, columnwise_storage, quantizer, fake_dtype=None)
+
+.. autoapiclass:: transformer_engine.pytorch.IdentityTensorStorage(*, hp_data, fake_dtype=None, quantizer=None)
+
 .. autoapiclass:: transformer_engine.pytorch.Float8Tensor(shape, dtype, data, fp8_scale_inv, fp8_dtype, requires_grad=False, data_transpose=None, quantizer=None)
 
 .. autoapiclass:: transformer_engine.pytorch.MXFP8Tensor(rowwise_data, rowwise_scale_inv, columnwise_data, columnwise_scale_inv, fp8_dtype, quantizer)
@@ -123,6 +194,10 @@ Quantized tensors
 .. autoapiclass:: transformer_engine.pytorch.Float8BlockwiseQTensor(rowwise_data, rowwise_scale_inv, columnwise_data, columnwise_scale_inv, fp8_dtype, quantizer, is_2D_scaled, data_format)
 
 .. autoapiclass:: transformer_engine.pytorch.NVFP4Tensor(rowwise_data, rowwise_scale_inv, columnwise_data, columnwise_scale_inv, amax_rowwise, amax_columnwise, fp4_dtype, quantizer)
+
+.. autoapiclass:: transformer_engine.pytorch.HybridQuantizedTensor(shape, dtype, *, rowwise_storage, columnwise_storage, quantizer, requires_grad=False, device=None)
+
+.. autoapiclass:: transformer_engine.pytorch.IdentityTensor(shape, dtype, *, hp_data, quantizer=None, requires_grad=False, device=None)
 
 Quantizers
 ----------
@@ -139,6 +214,10 @@ Quantizers
 .. autoapiclass:: transformer_engine.pytorch.Float8BlockQuantizer(fp8_dtype, *, rowwise, columnwise, **kwargs)
 
 .. autoapiclass:: transformer_engine.pytorch.NVFP4Quantizer(fp4_dtype, *, rowwise=True, columnwise=True, **kwargs)
+
+.. autoapiclass:: transformer_engine.pytorch.HybridQuantizer(*, rowwise_quantizer, columnwise_quantizer, columnwise_source="original")
+
+.. autoapiclass:: transformer_engine.pytorch.IdentityQuantizer(*, dtype=None, rowwise=True, columnwise=True)
 
 Tensor saving and restoring functions
 -------------------------------------
@@ -166,6 +245,8 @@ Operation fuser
 
 .. autoapifunction:: transformer_engine.pytorch.ops.register_backward_fusion
 
+.. autoapifunction:: transformer_engine.pytorch.ops.register_forward_backward_fusion
+
 .. autoapiclass:: transformer_engine.pytorch.ops.Linear
 
 .. autoapiclass:: transformer_engine.pytorch.ops.AddExtraInput
@@ -176,6 +257,8 @@ Operation fuser
 
 .. autoapiclass:: transformer_engine.pytorch.ops.BasicLinear
    :members: _functional_forward, _functional_backward
+
+.. autoapiclass:: transformer_engine.pytorch.ops.BatchedLinear
 
 .. autoapiclass:: transformer_engine.pytorch.ops.Bias
 
@@ -228,6 +311,16 @@ Operation fuser
 .. autoapiclass:: transformer_engine.pytorch.ops.SiLU
 
 .. autoapiclass:: transformer_engine.pytorch.ops.SwiGLU
+
+.. autoapifunction:: transformer_engine.pytorch.triton.mhc.mhc_fused_sinkhorn
+
+.. autoapifunction:: transformer_engine.pytorch.triton.mhc.mhc_fused_scale
+
+.. autoapifunction:: transformer_engine.pytorch.triton.mhc.mhc_fused_aggregate
+
+.. autoapifunction:: transformer_engine.pytorch.triton.mhc.mhc_fused_expand_combine
+
+.. autoapifunction:: transformer_engine.pytorch.triton.mhc.mhc_fused_projection
 
 Deprecated functions
 --------------------

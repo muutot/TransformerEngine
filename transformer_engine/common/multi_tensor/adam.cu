@@ -380,15 +380,19 @@ struct AdamFunctor {
   }
 };
 
-template <typename T, typename FULL_T, typename MOMENT_T>
+template <typename PARAM_T, typename GRAD_T, typename MOMENT_T, typename index_t>
 struct AdamCapturableFunctor {
-  __device__ __forceinline__ void operator()(int chunk_size, volatile int *noop_gmem,
+  __device__ __forceinline__ void operator()(index_t chunk_size, volatile int *noop_gmem,
                                              TensorListMetadata<4> &tl,  // NOLINT(*)
                                              const float beta1, const float beta2, const int *step,
                                              const int bias_correction, const float epsilon,
-                                             const float *lr, adamMode_t mode, const float decay,
-                                             const float *inv_scale) {
+                                             const float *lr_ptr, adamMode_t mode,
+                                             const float decay, const float *inv_scale_ptr) {
     if (*noop_gmem == 1) return;
+
+    const float lr = *lr_ptr;
+    const float inv_scale = *inv_scale_ptr;
+    const bool write_unscaled_grads = inv_scale != 1.0f;
 
     float beta1_correction = 1.0f, beta2_correction = 1.0f;
     if (bias_correction == 1) {
@@ -396,18 +400,18 @@ struct AdamCapturableFunctor {
       beta2_correction = 1 - pow(beta2, *step);
     }
 
-    int tensor_loc = tl.block_to_tensor[blockIdx.x];
+    index_t tensor_loc = tl.block_to_tensor[blockIdx.x];
 
     // potentially use to pass in list of scalar
     // int tensor_num = tl.start_tensor_this_launch + tensor_loc;
 
-    int chunk_idx = tl.block_to_chunk[blockIdx.x];
-    int n = tl.sizes[tensor_loc];
+    index_t chunk_idx = tl.block_to_chunk[blockIdx.x];
+    index_t n = tl.sizes[tensor_loc];
 
-    T *g = reinterpret_cast<T *>(tl.addresses[0][tensor_loc]);
+    GRAD_T *g = reinterpret_cast<GRAD_T *>(tl.addresses[0][tensor_loc]);
     g += chunk_idx * chunk_size;
 
-    T *p = reinterpret_cast<T *>(tl.addresses[1][tensor_loc]);
+    PARAM_T *p = reinterpret_cast<PARAM_T *>(tl.addresses[1][tensor_loc]);
     p += chunk_idx * chunk_size;
 
     MOMENT_T *m = reinterpret_cast<MOMENT_T *>(tl.addresses[2][tensor_loc]);
@@ -419,7 +423,7 @@ struct AdamCapturableFunctor {
     n -= chunk_idx * chunk_size;
 
     // see note in multi_tensor_scale_kernel.cu
-    for (int i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x * ILP) {
+    for (index_t i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x * ILP) {
       MATH_T r_g[ILP];
       MATH_T r_p[ILP];
       MATH_T r_m[ILP];
@@ -428,8 +432,7 @@ struct AdamCapturableFunctor {
       for (int ii = 0; ii < ILP; ii++) {
         int i = i_start + threadIdx.x + ii * blockDim.x;
         if (i < n && i < chunk_size) {
-          r_g[ii] = static_cast<MATH_T>(g[i]) * (*inv_scale);
-          g[i] = static_cast<T>(r_g[ii]);
+          r_g[ii] = static_cast<MATH_T>(g[i]) * inv_scale;
           r_p[ii] = static_cast<MATH_T>(p[i]);
           r_m[ii] = static_cast<MATH_T>(m[i]);
           r_v[ii] = static_cast<MATH_T>(v[i]);
@@ -438,6 +441,15 @@ struct AdamCapturableFunctor {
           r_p[ii] = MATH_T(0);
           r_m[ii] = MATH_T(0);
           r_v[ii] = MATH_T(0);
+        }
+      }
+      if (write_unscaled_grads) {
+#pragma unroll
+        for (int ii = 0; ii < ILP; ii++) {
+          int i = i_start + threadIdx.x + ii * blockDim.x;
+          if (i < n && i < chunk_size) {
+            g[i] = static_cast<GRAD_T>(r_g[ii]);
+          }
         }
       }
 #pragma unroll
@@ -450,7 +462,7 @@ struct AdamCapturableFunctor {
           MATH_T next_v_unbiased = r_v[ii] / beta2_correction;
           MATH_T denom = sqrtf(next_v_unbiased) + epsilon;
           MATH_T update = next_m_unbiased / denom;
-          r_p[ii] = r_p[ii] - (*lr * update);
+          r_p[ii] = r_p[ii] - (lr * update);
         } else {  // weight decay
           r_m[ii] = beta1 * r_m[ii] + (1 - beta1) * r_g[ii];
           r_v[ii] = beta2 * r_v[ii] + (1 - beta2) * r_g[ii] * r_g[ii];
@@ -458,14 +470,14 @@ struct AdamCapturableFunctor {
           MATH_T next_v_unbiased = r_v[ii] / beta2_correction;
           MATH_T denom = sqrtf(next_v_unbiased) + epsilon;
           MATH_T update = (next_m_unbiased / denom) + (decay * r_p[ii]);
-          r_p[ii] = r_p[ii] - (*lr * update);
+          r_p[ii] = r_p[ii] - (lr * update);
         }
       }
 #pragma unroll
       for (int ii = 0; ii < ILP; ii++) {
         int i = i_start + threadIdx.x + ii * blockDim.x;
         if (i < n && i < chunk_size) {
-          p[i] = static_cast<T>(r_p[ii]);
+          p[i] = static_cast<PARAM_T>(r_p[ii]);
           m[i] = static_cast<MOMENT_T>(r_m[ii]);
           v[i] = static_cast<MOMENT_T>(r_v[ii]);
         }
@@ -474,15 +486,19 @@ struct AdamCapturableFunctor {
   }
 };
 
-template <typename T, typename FULL_T, typename MOMENT_T>
+template <typename PARAM_T, typename GRAD_T, typename FULL_T, typename MOMENT_T, typename index_t>
 struct AdamCapturableMasterFunctor {
-  __device__ __forceinline__ void operator()(int chunk_size, volatile int *noop_gmem,
+  __device__ __forceinline__ void operator()(index_t chunk_size, volatile int *noop_gmem,
                                              TensorListMetadata<5> &tl,  // NOLINT(*)
                                              const float beta1, const float beta2, const int *step,
                                              const int bias_correction, const float epsilon,
-                                             const float *lr, adamMode_t mode, const float decay,
-                                             const float *inv_scale) {
+                                             const float *lr_ptr, adamMode_t mode,
+                                             const float decay, const float *inv_scale_ptr) {
     if (*noop_gmem == 1) return;
+
+    const float lr = *lr_ptr;
+    const float inv_scale = *inv_scale_ptr;
+    const bool write_unscaled_grads = inv_scale != 1.0f;
 
     float beta1_correction = 1.0f, beta2_correction = 1.0f;
     if (bias_correction == 1) {
@@ -490,18 +506,18 @@ struct AdamCapturableMasterFunctor {
       beta2_correction = 1 - pow(beta2, *step);
     }
 
-    int tensor_loc = tl.block_to_tensor[blockIdx.x];
+    index_t tensor_loc = tl.block_to_tensor[blockIdx.x];
 
     // potentially use to pass in list of scalar
     // int tensor_num = tl.start_tensor_this_launch + tensor_loc;
 
-    int chunk_idx = tl.block_to_chunk[blockIdx.x];
-    int n = tl.sizes[tensor_loc];
+    index_t chunk_idx = tl.block_to_chunk[blockIdx.x];
+    index_t n = tl.sizes[tensor_loc];
 
-    T *g = reinterpret_cast<T *>(tl.addresses[0][tensor_loc]);
+    GRAD_T *g = reinterpret_cast<GRAD_T *>(tl.addresses[0][tensor_loc]);
     g += chunk_idx * chunk_size;
 
-    T *p = reinterpret_cast<T *>(tl.addresses[1][tensor_loc]);
+    PARAM_T *p = reinterpret_cast<PARAM_T *>(tl.addresses[1][tensor_loc]);
     p += chunk_idx * chunk_size;
 
     MOMENT_T *m = reinterpret_cast<MOMENT_T *>(tl.addresses[2][tensor_loc]);
@@ -516,7 +532,7 @@ struct AdamCapturableMasterFunctor {
     n -= chunk_idx * chunk_size;
 
     // see note in multi_tensor_scale_kernel.cu
-    for (int i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x * ILP) {
+    for (index_t i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x * ILP) {
       MATH_T r_g[ILP];
       MATH_T r_p[ILP];
       MATH_T r_m[ILP];
@@ -525,8 +541,7 @@ struct AdamCapturableMasterFunctor {
       for (int ii = 0; ii < ILP; ii++) {
         int i = i_start + threadIdx.x + ii * blockDim.x;
         if (i < n && i < chunk_size) {
-          r_g[ii] = static_cast<MATH_T>(g[i]) * (*inv_scale);
-          g[i] = static_cast<T>(r_g[ii]);
+          r_g[ii] = static_cast<MATH_T>(g[i]) * inv_scale;
           r_p[ii] = static_cast<MATH_T>(p_master[i]);
           r_m[ii] = static_cast<MATH_T>(m[i]);
           r_v[ii] = static_cast<MATH_T>(v[i]);
@@ -535,6 +550,15 @@ struct AdamCapturableMasterFunctor {
           r_p[ii] = MATH_T(0);
           r_m[ii] = MATH_T(0);
           r_v[ii] = MATH_T(0);
+        }
+      }
+      if (write_unscaled_grads) {
+#pragma unroll
+        for (int ii = 0; ii < ILP; ii++) {
+          int i = i_start + threadIdx.x + ii * blockDim.x;
+          if (i < n && i < chunk_size) {
+            g[i] = static_cast<GRAD_T>(r_g[ii]);
+          }
         }
       }
 #pragma unroll
@@ -547,7 +571,7 @@ struct AdamCapturableMasterFunctor {
           MATH_T next_v_unbiased = r_v[ii] / beta2_correction;
           MATH_T denom = sqrtf(next_v_unbiased) + epsilon;
           MATH_T update = next_m_unbiased / denom;
-          r_p[ii] = r_p[ii] - (*lr * update);
+          r_p[ii] = r_p[ii] - (lr * update);
         } else {  // weight decay
           r_m[ii] = beta1 * r_m[ii] + (1 - beta1) * r_g[ii];
           r_v[ii] = beta2 * r_v[ii] + (1 - beta2) * r_g[ii] * r_g[ii];
@@ -555,14 +579,14 @@ struct AdamCapturableMasterFunctor {
           MATH_T next_v_unbiased = r_v[ii] / beta2_correction;
           MATH_T denom = sqrtf(next_v_unbiased) + epsilon;
           MATH_T update = (next_m_unbiased / denom) + (decay * r_p[ii]);
-          r_p[ii] = r_p[ii] - (*lr * update);
+          r_p[ii] = r_p[ii] - (lr * update);
         }
       }
 #pragma unroll
       for (int ii = 0; ii < ILP; ii++) {
         int i = i_start + threadIdx.x + ii * blockDim.x;
         if (i < n && i < chunk_size) {
-          p[i] = static_cast<T>(r_p[ii]);
+          p[i] = static_cast<PARAM_T>(r_p[ii]);
           p_master[i] = static_cast<FULL_T>(r_p[ii]);
           m[i] = static_cast<MOMENT_T>(r_m[ii]);
           v[i] = static_cast<MOMENT_T>(r_v[ii]);
@@ -571,6 +595,18 @@ struct AdamCapturableMasterFunctor {
     }
   }
 };
+
+// Whether any tensor is too large to index with 32-bit integers
+bool requires_64bit_indexing(const std::vector<std::vector<Tensor *>> &tensor_lists) {
+  for (const auto &tensor_list : tensor_lists) {
+    for (const Tensor *tensor : tensor_list) {
+      if (tensor->numel() >= INT_MAX) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 void multi_tensor_adam_cuda(int chunk_size, Tensor noop_flag,
                             std::vector<std::vector<Tensor *>> tensor_lists, const float lr,
@@ -624,25 +660,11 @@ void multi_tensor_adam_cuda(int chunk_size, Tensor noop_flag,
     }
   }
 
-  // Check if 64-bit indices are required
-  bool requires_64bit_indexing = false;
-  for (size_t i = 0; i < num_tensor_lists; i++) {
-    for (size_t j = 0; j < num_tensors_per_list; j++) {
-      if (tensor_lists[i][j]->numel() >= INT_MAX) {
-        requires_64bit_indexing = true;
-        break;
-      }
-    }
-    if (requires_64bit_indexing) {
-      break;
-    }
-  }
-
   // Get moment dtype (m and v have the same dtype, already validated above)
   const auto moment_type_te = tensor_lists[2][0]->dtype();
 
   // Launch kernel
-  if (requires_64bit_indexing) {
+  if (requires_64bit_indexing(tensor_lists)) {
     if (num_tensor_lists == 4) {
       // g, p, m, v
       TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
@@ -819,22 +841,8 @@ void multi_tensor_adam_fp8_cuda(int chunk_size, Tensor noop_flag,
                ", but expected dtype=", to_string(DType::kFloat32));
   }
 
-  // Check if 64-bit indices are required
-  bool requires_64bit_indexing = false;
-  for (size_t i = 0; i < num_tensor_lists; i++) {
-    for (size_t j = 0; j < num_tensors_per_list; j++) {
-      if (tensor_lists[i][j]->numel() >= INT_MAX) {
-        requires_64bit_indexing = true;
-        break;
-      }
-    }
-    if (requires_64bit_indexing) {
-      break;
-    }
-  }
-
   // Launch kernel
-  if (requires_64bit_indexing) {
+  if (requires_64bit_indexing(tensor_lists)) {
     TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
         fp8_dtype, FP8_T,
         TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
@@ -874,13 +882,14 @@ void multi_tensor_adam_capturable_cuda(int chunk_size, Tensor noop_flag,
 
   // Check tensor dtypes
   const auto g_in_type_te = tensor_lists[0][0]->dtype();
+  const auto p_in_type_te = tensor_lists[1][0]->dtype();
   for (size_t j = 0; j < num_tensors_per_list; j++) {
     NVTE_CHECK(tensor_lists[0][j]->dtype() == g_in_type_te, "Grad tensor ", j,
                " has dtype=", to_string(tensor_lists[0][j]->dtype()),
                ", but expected dtype=", to_string(g_in_type_te));
-    NVTE_CHECK(tensor_lists[1][j]->dtype() == g_in_type_te, "Param tensor ", j,
+    NVTE_CHECK(tensor_lists[1][j]->dtype() == p_in_type_te, "Param tensor ", j,
                " has dtype=", to_string(tensor_lists[1][j]->dtype()),
-               ", but expected dtype=", to_string(g_in_type_te));
+               ", but expected dtype=", to_string(p_in_type_te));
     {
       const bool m_is_fp32 = tensor_lists[2][j]->dtype() == DType::kFloat32;
       const bool m_is_bf16 = tensor_lists[2][j]->dtype() == DType::kBFloat16;
@@ -898,15 +907,33 @@ void multi_tensor_adam_capturable_cuda(int chunk_size, Tensor noop_flag,
   const auto moment_type_te = tensor_lists[2][0]->dtype();
 
   // Launch kernel
-  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
-      tensor_lists[0][0]->dtype(), dtype,
-      TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
-          moment_type_te, moment_type,
-          multi_tensor_apply<4>(BLOCK_SIZE, chunk_size, noop_flag, tensor_lists,
-                                AdamCapturableFunctor<dtype, float, moment_type>(), stream, beta1,
-                                beta2, reinterpret_cast<int *>(step.data.dptr), bias_correction,
-                                epsilon, reinterpret_cast<float *>(lr.data.dptr), (adamMode_t)mode,
-                                weight_decay, reinterpret_cast<float *>(inv_scale.data.dptr));))
+  if (requires_64bit_indexing(tensor_lists)) {
+    TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+        p_in_type_te, p_in_type,
+        TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+            g_in_type_te, g_in_type,
+            TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
+                moment_type_te, moment_type,
+                multi_tensor_apply<4>(
+                    (int64_t)BLOCK_SIZE, (int64_t)chunk_size, noop_flag, tensor_lists,
+                    AdamCapturableFunctor<p_in_type, g_in_type, moment_type, int64_t>(), stream,
+                    beta1, beta2, reinterpret_cast<int *>(step.data.dptr), bias_correction, epsilon,
+                    reinterpret_cast<float *>(lr.data.dptr), (adamMode_t)mode, weight_decay,
+                    reinterpret_cast<float *>(inv_scale.data.dptr));)))
+  } else {
+    TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+        p_in_type_te, p_in_type,
+        TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+            g_in_type_te, g_in_type,
+            TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
+                moment_type_te, moment_type,
+                multi_tensor_apply<4>(
+                    BLOCK_SIZE, chunk_size, noop_flag, tensor_lists,
+                    AdamCapturableFunctor<p_in_type, g_in_type, moment_type, int32_t>(), stream,
+                    beta1, beta2, reinterpret_cast<int *>(step.data.dptr), bias_correction, epsilon,
+                    reinterpret_cast<float *>(lr.data.dptr), (adamMode_t)mode, weight_decay,
+                    reinterpret_cast<float *>(inv_scale.data.dptr));)))
+  }
 
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
@@ -918,9 +945,9 @@ void multi_tensor_adam_capturable_master_cuda(int chunk_size, Tensor noop_flag,
                                               const int bias_correction, const float weight_decay,
                                               Tensor inv_scale, cudaStream_t stream) {
   // Check tensor list sizes
-  // 4 tensor lists: g, p, m, v, p_master
+  // 5 tensor lists: g, p, m, v, p_master
   const size_t num_tensor_lists = tensor_lists.size();
-  NVTE_CHECK(num_tensor_lists == 5, "Expected 4 tensor lists, but found ", num_tensor_lists);
+  NVTE_CHECK(num_tensor_lists == 5, "Expected 5 tensor lists, but found ", num_tensor_lists);
   const size_t num_tensors_per_list = tensor_lists[0].size();
   for (size_t i = 1; i < num_tensor_lists; i++) {
     NVTE_CHECK(tensor_lists[i].size() == num_tensors_per_list, "Tensor list ", i,
@@ -929,13 +956,14 @@ void multi_tensor_adam_capturable_master_cuda(int chunk_size, Tensor noop_flag,
 
   // Check tensor dtypes
   const auto g_in_type_te = tensor_lists[0][0]->dtype();
+  const auto p_in_type_te = tensor_lists[1][0]->dtype();
   for (size_t j = 0; j < num_tensors_per_list; j++) {
     NVTE_CHECK(tensor_lists[0][j]->dtype() == g_in_type_te, "Grad tensor ", j,
                " has dtype=", to_string(tensor_lists[0][j]->dtype()),
                ", but expected dtype=", to_string(g_in_type_te));
-    NVTE_CHECK(tensor_lists[1][j]->dtype() == g_in_type_te, "Param tensor ", j,
+    NVTE_CHECK(tensor_lists[1][j]->dtype() == p_in_type_te, "Param tensor ", j,
                " has dtype=", to_string(tensor_lists[1][j]->dtype()),
-               ", but expected dtype=", to_string(g_in_type_te));
+               ", but expected dtype=", to_string(p_in_type_te));
     {
       const bool m_is_fp32 = tensor_lists[2][j]->dtype() == DType::kFloat32;
       const bool m_is_bf16 = tensor_lists[2][j]->dtype() == DType::kBFloat16;
@@ -956,16 +984,35 @@ void multi_tensor_adam_capturable_master_cuda(int chunk_size, Tensor noop_flag,
   const auto moment_type_te = tensor_lists[2][0]->dtype();
 
   // Launch kernel
-  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
-      tensor_lists[0][0]->dtype(), dtype,
-      TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
-          moment_type_te, moment_type,
-          multi_tensor_apply<5>(BLOCK_SIZE, chunk_size, noop_flag, tensor_lists,
-                                AdamCapturableMasterFunctor<dtype, float, moment_type>(), stream,
-                                beta1, beta2, reinterpret_cast<int *>(step.data.dptr),
-                                bias_correction, epsilon, reinterpret_cast<float *>(lr.data.dptr),
-                                (adamMode_t)mode, weight_decay,
-                                reinterpret_cast<float *>(inv_scale.data.dptr));))
+  if (requires_64bit_indexing(tensor_lists)) {
+    TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+        p_in_type_te, p_in_type,
+        TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+            g_in_type_te, g_in_type,
+            TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
+                moment_type_te, moment_type,
+                multi_tensor_apply<5>(
+                    (int64_t)BLOCK_SIZE, (int64_t)chunk_size, noop_flag, tensor_lists,
+                    AdamCapturableMasterFunctor<p_in_type, g_in_type, float, moment_type,
+                                                int64_t>(),
+                    stream, beta1, beta2, reinterpret_cast<int *>(step.data.dptr), bias_correction,
+                    epsilon, reinterpret_cast<float *>(lr.data.dptr), (adamMode_t)mode,
+                    weight_decay, reinterpret_cast<float *>(inv_scale.data.dptr));)))
+  } else {
+    TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+        p_in_type_te, p_in_type,
+        TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+            g_in_type_te, g_in_type,
+            TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
+                moment_type_te, moment_type,
+                multi_tensor_apply<5>(
+                    BLOCK_SIZE, chunk_size, noop_flag, tensor_lists,
+                    AdamCapturableMasterFunctor<p_in_type, g_in_type, float, moment_type,
+                                                int32_t>(),
+                    stream, beta1, beta2, reinterpret_cast<int *>(step.data.dptr), bias_correction,
+                    epsilon, reinterpret_cast<float *>(lr.data.dptr), (adamMode_t)mode,
+                    weight_decay, reinterpret_cast<float *>(inv_scale.data.dptr));)))
+  }
 
   NVTE_CHECK_CUDA(cudaGetLastError());
 }

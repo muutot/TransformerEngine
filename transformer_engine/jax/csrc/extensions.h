@@ -23,6 +23,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "common/common.h"
@@ -39,6 +40,7 @@ namespace jax {
 struct ClampedSwigluConfig {
   float limit;
   float alpha;
+  float glu_linear_offset;
 };
 
 struct ActivationConfig {
@@ -130,28 +132,34 @@ pybind11::tuple GetDBiasQuantizeWorkspaceSizes(size_t batch_size, size_t hidden_
 
 // Softmax
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledSoftmaxForwardHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledSoftmaxForwardInitializeHandler);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledSoftmaxBackwardHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledSoftmaxBackwardInitializeHandler);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledMaskedSoftmaxForwardHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledMaskedSoftmaxForwardInitializeHandler);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledMaskedSoftmaxBackwardHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledMaskedSoftmaxBackwardInitializeHandler);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledUpperTriangMaskedSoftmaxForwardHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledUpperTriangMaskedSoftmaxForwardInitializeHandler);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledUpperTriangMaskedSoftmaxBackwardHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(ScaledUpperTriangMaskedSoftmaxBackwardInitializeHandler);
 
 // Attention
 XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedAttnForwardHandler);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedAttnBackwardHandler);
 
-NVTE_Fused_Attn_Backend GetFusedAttnBackend(
-    bool is_training, DType q_dtype, DType kv_dtype, NVTE_QKV_Layout qkv_layout,
-    NVTE_Bias_Type bias_type, NVTE_Mask_Type mask_type, NVTE_Softmax_Type softmax_type,
-    float dropout_probability, size_t q_attn_heads, size_t kv_attn_heads, size_t q_max_seqlen,
-    size_t kv_max_seqlen, size_t qk_head_dim, size_t v_head_dim, int64_t window_size_left,
-    int64_t window_size_right, bool deterministic);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedAttnScoreModForwardHandler);
+
+XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedAttnScoreModBackwardHandler);
+
+std::tuple<NVTE_Fused_Attn_Backend, std::string> GetFusedAttnBackend(
+    const pybind11::object &params);
 
 pybind11::tuple GetFusedAttnForwardWorkspaceSizes(
     size_t input_batch, size_t bias_batch, size_t q_max_seqlen, size_t kv_max_seqlen,
@@ -159,7 +167,7 @@ pybind11::tuple GetFusedAttnForwardWorkspaceSizes(
     size_t v_head_dim, float scaling_factor, float dropout_probability, NVTE_Bias_Type bias_type,
     NVTE_Mask_Type mask_type, NVTE_Softmax_Type softmax_type, NVTE_QKV_Layout qkv_layout,
     DType dtype, bool is_training, size_t max_segments_per_seq, int64_t window_size_left,
-    int64_t window_size_right, bool bottom_right_diagonal);
+    int64_t window_size_right, bool return_max_logit, bool bottom_right_diagonal);
 
 pybind11::tuple GetFusedAttnBackwardWorkspaceSizes(
     size_t input_batch, size_t bias_batch, size_t q_max_seqlen, size_t kv_max_seqlen,
@@ -199,6 +207,38 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedTopkWithScoreFunctionBackwardHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedMoEAuxLossForwardHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedMoEAuxLossBackwardHandler);
 
+// Bootstrap EP (eager NCCL comm init); anchor released by ReleaseEpResources.
+// max_token_dtype is the NVTEDType enum value (int) for the widest token dtype
+// the group will dispatch.
+void SetEpBootstrapParams(pybind11::bytes unique_id_bytes, int ep_size, int rank_within_group,
+                          int num_experts, int max_tokens_per_rank, int max_recv_tokens_per_rank,
+                          int hidden_dim, int max_num_sms, int max_token_dtype,
+                          bool drop_on_overflow, bool borrowed_comm);
+void ReleaseEpResources();
+// Atexit-safe variant of ReleaseEpResources; never shuts down a borrowed
+// backend (see definition).
+void ReleaseEpResourcesAtExit();
+// Return the handle_mem byte size for a layer config.
+size_t EpHandleMemSize(int top_k, size_t dispatch_output_per_expert_alignment);
+
+// EpInstanceState type_id / type_info capsules for jax.ffi.register_ffi_type.
+pybind11::capsule GetEpInstanceStateTypeIdCapsule();
+pybind11::capsule GetEpInstanceStateTypeInfoCapsule();
+
+// EP FFI handlers
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpInstantiateHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpPrepareHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpPrepareAndDispatchHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchBwdHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineBwdHandler);
+
+// EP-specific execute stage of the borrowed-comm bootstrap op (see
+// tex.ep.use_nccl_comm_from_xla). The prepare stage is the generic
+// FfiRequestCliqueHandler in extensions/ffi_collectives.h.
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpBootstrapBorrowedCommHandler);
+
 // TopK
 XLA_FFI_DECLARE_HANDLER_SYMBOL(TopkHandler);
 pybind11::tuple GetTopkWorkspaceSizes(int batch_size, int seq_len, int k);
@@ -208,7 +248,8 @@ pybind11::tuple GetTopkWorkspaceSizes(int batch_size, int seq_len, int k);
 
 XLA_FFI_REGISTER_STRUCT_ATTR_DECODING(transformer_engine::jax::ClampedSwigluConfig,
                                       ::xla::ffi::StructMember<float>("limit"),
-                                      ::xla::ffi::StructMember<float>("alpha"));
+                                      ::xla::ffi::StructMember<float>("alpha"),
+                                      ::xla::ffi::StructMember<float>("glu_linear_offset"));
 
 XLA_FFI_REGISTER_STRUCT_ATTR_DECODING(
     transformer_engine::jax::ActivationConfig,
@@ -251,6 +292,7 @@ XLA_FFI_REGISTER_STRUCT_ATTR_DECODING(
 // ENUM_ATTR and DICT_ATTR recoding need to be registered in the global namespace
 XLA_FFI_REGISTER_ENUM_ATTR_DECODING(transformer_engine::jax::JAXX_Scaling_Mode);
 XLA_FFI_REGISTER_ENUM_ATTR_DECODING(transformer_engine::jax::JAXX_Score_Function);
+XLA_FFI_REGISTER_ENUM_ATTR_DECODING(transformer_engine::jax::JAXX_Routing_Map_Format);
 XLA_FFI_REGISTER_ENUM_ATTR_DECODING(transformer_engine::jax::JAXX_Collective_Op);
 XLA_FFI_REGISTER_ENUM_ATTR_DECODING(transformer_engine::jax::JAXX_Quantize_Layout);
 

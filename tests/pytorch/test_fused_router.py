@@ -1,20 +1,91 @@
 # Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
-import torch
+from copy import deepcopy
 from typing import Optional
+
+import pytest
+import torch
+
 from transformer_engine.pytorch.router import (
+    QBHistogramMode,
+    RoutingMapFormat,
     fused_topk_with_score_function,
     fused_compute_score_for_moe_aux_loss,
     fused_moe_aux_loss,
+    mark_qb_bin_bounds_validated,
 )
-import pytest
-from copy import deepcopy
+import transformer_engine.pytorch.router as te_router
+import transformer_engine_torch as tex
 
 seed = 42
 torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
+
+
+@pytest.mark.parametrize("topk", [1, 10, 32])
+@pytest.mark.parametrize("histogram_mode", [None, "two_kernel", "fused_atomic"])
+@pytest.mark.parametrize("layout", ["bytemap", "bitmap_u8", "dense"])
+@pytest.mark.parametrize("mixed_scores", [False, True])
+def test_sigmoid_bias_preserves_tiny_scores(topk, histogram_mode, layout, mixed_scores):
+    """Bias affects selection, but must not round away the selected raw scores."""
+    num_tokens, num_experts, num_bins = 17, 512, 1000
+    logits = torch.linspace(-8.0, -4.0, num_experts, device="cuda").repeat(num_tokens, 1)
+    logits[:, :topk] = -16.0 - torch.arange(topk, device="cuda") % 9
+    if mixed_scores:
+        logits[:, 0] = -1.0
+    logits.requires_grad_(True)
+    expert_bias = torch.zeros(num_experts, device="cuda")
+    expert_bias[:topk] = 0.75 + 0.001 * torch.arange(topk, device="cuda")
+    expert_bias -= expert_bias.mean()
+    bin_bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, num_bins, dtype=torch.int32, device="cuda")
+    reference_probs, reference_map = topk_score_function_pytorch(
+        logits, topk, scaling_factor=3.16, score_function="sigmoid", expert_bias=expert_bias
+    )
+    kwargs = {}
+    if histogram_mode is not None:
+        kwargs.update(
+            qb_histogram=histogram,
+            qb_bin_bounds=bin_bounds,
+            qb_histogram_mode=histogram_mode,
+        )
+    if layout == "dense":
+        kwargs["topk_indices"] = torch.empty(num_tokens, topk, dtype=torch.int16, device="cuda")
+    fused_logits = logits.detach().clone().requires_grad_(True)
+    probs, routing = fused_topk_with_score_function(
+        fused_logits,
+        topk,
+        False,
+        None,
+        None,
+        3.16,
+        "sigmoid",
+        expert_bias,
+        routing_map_format="bitmap_u8" if layout == "bitmap_u8" else "bytemap",
+        **kwargs,
+    )
+    if layout == "dense":
+        routing = topk_indices_to_routing_map(routing, num_experts)
+    elif layout == "bitmap_u8":
+        reference_map = _bytemap_to_bitmap_u8(reference_map)
+    torch.testing.assert_close(routing, reference_map)
+    # An absolute tolerance would hide precisely the tiny values under test.
+    torch.testing.assert_close(probs, reference_probs, atol=0, rtol=5e-6)
+    assert torch.all(probs[:, :topk] > 0)
+    if histogram_mode is not None:
+        reference = qb_topk_score_function_pytorch(logits, topk, expert_bias, bin_bounds, num_bins)
+        torch.testing.assert_close(histogram, reference["histogram"])
+    # Nonuniform upstream gradients exercise the normalization derivative.
+    upstream = torch.linspace(-0.7, 1.3, num_experts, device="cuda").expand_as(probs)
+    probs.backward(upstream)
+    reference_probs.backward(upstream)
+    torch.testing.assert_close(fused_logits.grad, logits.grad, atol=2e-7, rtol=2e-4)
+    if mixed_scores and topk > 1:
+        torch.testing.assert_close(
+            fused_logits.grad[:, 1:topk], logits.grad[:, 1:topk], atol=0, rtol=2e-4
+        )
 
 
 def _get_tolerances(dtype: torch.dtype, num_experts: int):
@@ -129,6 +200,63 @@ def topk_score_function_pytorch(
     return topk_masked_gates, topk_map
 
 
+def qb_topk_score_function_pytorch(
+    logits: torch.Tensor,
+    topk: int,
+    expert_bias: torch.Tensor,
+    bin_bounds: torch.Tensor,
+    num_bins: int,
+    histogram: Optional[torch.Tensor] = None,
+):
+    """Pure-PyTorch reference for Kimi K3 QB routing and histogram accumulation."""
+    original_shape = logits.shape
+    num_experts = original_shape[-1]
+    raw_scores = torch.sigmoid(logits.float()).reshape(-1, num_experts)
+    biased_scores = raw_scores + expert_bias
+    topk_plus_one_scores, topk_plus_one_indices = torch.topk(biased_scores, k=topk + 1, dim=-1)
+    cutoff = topk_plus_one_scores.min(dim=-1).values
+    cutoff_candidates = topk_plus_one_indices.masked_fill(
+        topk_plus_one_scores != cutoff.unsqueeze(1), -1
+    )
+    dropped_expert = cutoff_candidates.max(dim=-1).values
+    topk_indices = topk_plus_one_indices[
+        topk_plus_one_indices != dropped_expert.unsqueeze(1)
+    ].reshape(-1, topk)
+
+    selected_raw_scores = torch.gather(raw_scores, 1, topk_indices)
+    if topk > 1:
+        selected_probs = selected_raw_scores / (
+            selected_raw_scores.sum(dim=-1, keepdim=True) + 1e-20
+        )
+    else:
+        selected_probs = selected_raw_scores
+    probs = torch.zeros_like(raw_scores).scatter(1, topk_indices, selected_probs)
+    routing_map = torch.zeros_like(raw_scores, dtype=torch.bool).scatter(1, topk_indices, True)
+
+    lower, upper = bin_bounds[0], bin_bounds[1]
+    required_bias = cutoff.unsqueeze(1) - raw_scores
+    bin_scale = num_bins / (upper - lower)
+    bin_indices = torch.floor((required_bias - lower) * bin_scale).to(torch.int64)
+    bin_indices.clamp_(0, num_bins - 1)
+    expert_offsets = torch.arange(num_experts, device=logits.device, dtype=torch.int64) * num_bins
+    flat_indices = (bin_indices + expert_offsets).reshape(-1)
+    counts = torch.bincount(flat_indices, minlength=num_experts * num_bins)
+    counts = counts.reshape(num_experts, num_bins).to(torch.int32)
+    if histogram is None:
+        histogram = torch.zeros_like(counts)
+    histogram.add_(counts)
+
+    return {
+        "probs": probs.reshape(original_shape).to(logits.dtype),
+        "routing_map": routing_map.reshape(original_shape),
+        "topk_indices": topk_indices.reshape(*original_shape[:-1], topk),
+        "raw_scores": raw_scores.reshape(original_shape),
+        "cutoff": cutoff.reshape(original_shape[:-1]),
+        "bin_indices": bin_indices.reshape(original_shape),
+        "histogram": histogram,
+    }
+
+
 # Pytorch-based compute routing scores for aux loss
 def compute_scores_for_aux_loss_pytorch(
     logits: torch.Tensor, topk: int, score_function: str
@@ -165,6 +293,15 @@ def aux_loss_pytorch(
     return aux_loss
 
 
+def topk_indices_to_routing_map(topk_indices: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Convert dense [num_tokens, topk] top-k indices to a bool routing map."""
+    routing_map = torch.zeros(
+        topk_indices.size(0), num_experts, dtype=torch.bool, device=topk_indices.device
+    )
+    routing_map.scatter_(1, topk_indices.long(), True)
+    return routing_map
+
+
 def run_comparison(
     dtype,
     num_tokens,
@@ -176,6 +313,8 @@ def run_comparison(
     scaling_factor,
     score_function,
     enable_bias,
+    topk_output_mode="sparse",
+    topk_index_dtype=torch.int16,
 ):
     if topk >= num_experts:
         pytest.skip(f"topk ({topk}) >= num_experts ({num_experts})")
@@ -234,8 +373,12 @@ def run_comparison(
         expert_bias=expert_bias,
     )
 
+    topk_indices = None
+    if topk_output_mode == "dense":
+        topk_indices = torch.empty((num_tokens, topk), device="cuda", dtype=topk_index_dtype)
+
     # Run the fused implementation
-    probs_fused, routing_map_fused = fused_topk_with_score_function(
+    probs_fused, routing_output_fused = fused_topk_with_score_function(
         logits=logits_clone,
         topk=topk,
         use_pre_softmax=use_pre_softmax,
@@ -244,7 +387,14 @@ def run_comparison(
         scaling_factor=scaling_factor,
         score_function=score_function,
         expert_bias=expert_bias_clone,
+        topk_indices=topk_indices,
     )
+    if topk_output_mode == "dense":
+        assert routing_output_fused.data_ptr() == topk_indices.data_ptr()
+        assert routing_output_fused.dtype == topk_index_dtype
+        routing_map_fused = topk_indices_to_routing_map(routing_output_fused, num_experts)
+    else:
+        routing_map_fused = routing_output_fused
 
     atol, rtol = _get_tolerances(dtype, num_experts)
     torch.testing.assert_close(probs, probs_fused, atol=atol, rtol=rtol)
@@ -269,6 +419,7 @@ def run_comparison(
 @pytest.mark.parametrize("group_topk", [None, 4])
 @pytest.mark.parametrize("scaling_factor", [None, 1.2])
 @pytest.mark.parametrize("enable_bias", [True, False])
+@pytest.mark.parametrize("topk_index_dtype", [None, torch.int16, torch.int32, torch.int64])
 def test_topk_sigmoid(
     dtype,
     num_tokens,
@@ -277,6 +428,7 @@ def test_topk_sigmoid(
     group_topk,
     scaling_factor,
     enable_bias,
+    topk_index_dtype,
 ):
     num_groups = 8 if group_topk else None
     run_comparison(
@@ -290,6 +442,8 @@ def test_topk_sigmoid(
         scaling_factor=scaling_factor,
         score_function="sigmoid",
         enable_bias=enable_bias,
+        topk_output_mode="dense" if topk_index_dtype is not None else "sparse",
+        topk_index_dtype=topk_index_dtype or torch.int16,
     )
 
 
@@ -300,6 +454,7 @@ def test_topk_sigmoid(
 @pytest.mark.parametrize("group_topk", [None, 4])
 @pytest.mark.parametrize("scaling_factor", [None, 1.2])
 @pytest.mark.parametrize("enable_bias", [True, False])
+@pytest.mark.parametrize("topk_index_dtype", [None, torch.int16, torch.int32, torch.int64])
 def test_topk_sqrtsoftplus(
     dtype,
     num_tokens,
@@ -308,6 +463,7 @@ def test_topk_sqrtsoftplus(
     group_topk,
     scaling_factor,
     enable_bias,
+    topk_index_dtype,
 ):
     num_groups = 8 if group_topk else None
     run_comparison(
@@ -321,7 +477,401 @@ def test_topk_sqrtsoftplus(
         scaling_factor=scaling_factor,
         score_function="sqrtsoftplus",
         enable_bias=enable_bias,
+        topk_output_mode="dense" if topk_index_dtype is not None else "sparse",
+        topk_index_dtype=topk_index_dtype or torch.int16,
     )
+
+
+@pytest.mark.parametrize("histogram_mode", ["two_kernel", "fused_atomic"])
+@pytest.mark.parametrize("topk", [8, 16])
+@pytest.mark.parametrize(
+    "routing_output_mode",
+    ["bytemap", "bitmap_u8", "dense_int16", "dense_int32", "dense_int64"],
+)
+def test_qb_topk_histogram(histogram_mode, topk, routing_output_mode):
+    num_tokens = 257
+    num_experts = 896
+    num_bins = 1000
+    logits = torch.randn(
+        num_tokens, num_experts, device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    expert_bias = torch.linspace(-0.2, 0.2, num_experts, device="cuda", dtype=torch.float32)
+    bin_bounds = torch.stack((expert_bias.min() - 1.0, expert_bias.max() + 1.0))
+    reference_histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+    reference = qb_topk_score_function_pytorch(
+        logits,
+        topk,
+        expert_bias,
+        bin_bounds,
+        num_bins,
+        reference_histogram,
+    )
+
+    fused_logits = logits.detach().clone().requires_grad_(True)
+    fused_histogram = torch.zeros_like(reference_histogram)
+    dense_dtype = {
+        "dense_int16": torch.int16,
+        "dense_int32": torch.int32,
+        "dense_int64": torch.int64,
+    }.get(routing_output_mode)
+    topk_indices = (
+        torch.empty(num_tokens, topk, device="cuda", dtype=dense_dtype)
+        if dense_dtype is not None
+        else None
+    )
+    routing_map_format = (
+        RoutingMapFormat.BITMAP_U8
+        if routing_output_mode == "bitmap_u8"
+        else RoutingMapFormat.BYTEMAP
+    )
+    fused_probs, fused_routing_output = fused_topk_with_score_function(
+        logits=fused_logits,
+        topk=topk,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=None,
+        score_function="sigmoid",
+        expert_bias=expert_bias,
+        routing_map_format=routing_map_format,
+        topk_indices=topk_indices,
+        qb_histogram=fused_histogram,
+        qb_bin_bounds=bin_bounds,
+        qb_histogram_mode=histogram_mode,
+    )
+    torch.testing.assert_close(fused_probs, reference["probs"])
+    if dense_dtype is not None:
+        fused_routing_map = topk_indices_to_routing_map(fused_routing_output, num_experts)
+        torch.testing.assert_close(fused_routing_map, reference["routing_map"])
+    elif routing_output_mode == "bitmap_u8":
+        torch.testing.assert_close(
+            fused_routing_output,
+            _bytemap_to_bitmap_u8(reference["routing_map"]),
+        )
+    else:
+        torch.testing.assert_close(fused_routing_output, reference["routing_map"])
+    torch.testing.assert_close(fused_histogram, reference["histogram"])
+
+    grad = torch.randn_like(fused_probs)
+    reference["probs"].backward(grad)
+    fused_probs.backward(grad)
+    torch.testing.assert_close(fused_logits.grad, logits.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("histogram_mode", ["two_kernel", "fused_atomic"])
+def test_qb_histogram_accumulates_microbatches(histogram_mode):
+    num_experts = 64
+    topk = 8
+    num_bins = 1000
+    expert_bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda", dtype=torch.float32)
+    bin_bounds = torch.stack((expert_bias.min() - 1.0, expert_bias.max() + 1.0))
+    reference_histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+    fused_histogram = torch.zeros_like(reference_histogram)
+
+    for num_tokens in (127, 193):
+        logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+        qb_topk_score_function_pytorch(
+            logits,
+            topk,
+            expert_bias,
+            bin_bounds,
+            num_bins,
+            reference_histogram,
+        )
+        fused_topk_with_score_function(
+            logits=logits,
+            topk=topk,
+            use_pre_softmax=False,
+            num_groups=None,
+            group_topk=None,
+            scaling_factor=None,
+            score_function="sigmoid",
+            expert_bias=expert_bias,
+            qb_histogram=fused_histogram,
+            qb_bin_bounds=bin_bounds,
+            qb_histogram_mode=histogram_mode,
+        )
+
+    torch.testing.assert_close(fused_histogram, reference_histogram)
+
+
+def test_qb_topk_argument_validation():
+    logits = torch.randn(16, 32, device="cuda", dtype=torch.float32)
+    expert_bias = torch.zeros(32, device="cuda", dtype=torch.float32)
+    histogram = torch.zeros(32, 1000, device="cuda", dtype=torch.int32)
+    bin_bounds = torch.tensor([-1.0, 1.0], device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="provided together"):
+        fused_topk_with_score_function(
+            logits,
+            4,
+            False,
+            None,
+            None,
+            None,
+            "sigmoid",
+            expert_bias,
+            qb_histogram=histogram,
+        )
+    with pytest.raises(ValueError, match="only supports"):
+        fused_topk_with_score_function(
+            logits,
+            4,
+            False,
+            None,
+            None,
+            None,
+            "softmax",
+            expert_bias,
+            qb_histogram=histogram,
+            qb_bin_bounds=bin_bounds,
+            qb_histogram_mode="two_kernel",
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
+@pytest.mark.parametrize("histogram_mode", ["two_kernel", "fused_atomic"])
+def test_qb_topk_uses_logits_device(histogram_mode):
+    current_device = torch.cuda.current_device()
+    logits_device = (current_device + 1) % torch.cuda.device_count()
+    device = torch.device("cuda", logits_device)
+    num_tokens, num_experts, topk, num_bins = 17, 32, 4, 64
+    logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    expert_bias = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    histogram = torch.zeros(num_experts, num_bins, device=device, dtype=torch.int32)
+    bin_bounds = torch.tensor([-1.0, 1.0], device=device, dtype=torch.float32)
+
+    probs, routing_map = fused_topk_with_score_function(
+        logits,
+        topk,
+        False,
+        None,
+        None,
+        None,
+        "sigmoid",
+        expert_bias,
+        qb_histogram=histogram,
+        qb_bin_bounds=bin_bounds,
+        qb_histogram_mode=histogram_mode,
+    )
+    torch.cuda.synchronize(logits_device)
+
+    assert probs.device == device
+    assert routing_map.device == device
+    assert histogram.sum().item() == num_tokens * num_experts
+    assert torch.cuda.current_device() == current_device
+
+
+@pytest.mark.parametrize("histogram_mode", ["two_kernel", "fused_atomic"])
+@pytest.mark.parametrize("use_dense_indices", [False, True])
+@pytest.mark.parametrize(
+    "invalid_bounds",
+    [[1.0, 1.0], [1.0, -1.0], [float("nan"), 1.0], [float("-inf"), float("inf")]],
+    ids=["equal", "reversed", "nan", "infinite"],
+)
+def test_qb_topk_invalid_bin_bounds_stay_in_histogram(
+    histogram_mode, use_dense_indices, invalid_bounds
+):
+    num_tokens, num_experts, num_bins, topk = 8, 16, 32, 4
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+    expert_bias = torch.zeros(num_experts, device="cuda", dtype=torch.float32)
+    histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+    bin_bounds = torch.tensor(invalid_bounds, device="cuda", dtype=torch.float32)
+    topk_indices = (
+        torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+        if use_dense_indices
+        else None
+    )
+
+    # bin_bounds values are not validated, so invalid bounds must neither raise nor write outside
+    # the histogram.
+    probs, routing_output = fused_topk_with_score_function(
+        logits,
+        topk,
+        False,
+        None,
+        None,
+        None,
+        "sigmoid",
+        expert_bias,
+        topk_indices=topk_indices,
+        qb_histogram=histogram,
+        qb_bin_bounds=bin_bounds,
+        qb_histogram_mode=histogram_mode,
+    )
+    torch.cuda.synchronize()
+
+    # Routing does not read the bounds, and every (token, expert) pair is counted in some bin.
+    valid_bounds = torch.tensor([-1.0, 1.0], device="cuda", dtype=torch.float32)
+    reference = qb_topk_score_function_pytorch(logits, topk, expert_bias, valid_bounds, num_bins)
+    torch.testing.assert_close(probs, reference["probs"])
+    if use_dense_indices:
+        torch.testing.assert_close(
+            topk_indices_to_routing_map(routing_output, num_experts), reference["routing_map"]
+        )
+    else:
+        torch.testing.assert_close(routing_output, reference["routing_map"])
+    assert histogram.sum().item() == num_tokens * num_experts
+
+
+@pytest.mark.parametrize("histogram_mode", ["two_kernel", "fused_atomic"])
+@pytest.mark.parametrize("use_dense_indices", [False, True])
+def test_qb_topk_cuda_graph_uses_mutable_bounds(histogram_mode, use_dense_indices):
+    logits = torch.randn(8, 16, device="cuda", dtype=torch.float32)
+    expert_bias = torch.zeros(16, device="cuda", dtype=torch.float32)
+    histogram = torch.zeros(16, 32, device="cuda", dtype=torch.int32)
+    bin_bounds = torch.tensor([-1.0, 1.0], device="cuda", dtype=torch.float32)
+    topk_indices = (
+        torch.empty(8, 4, device="cuda", dtype=torch.int32) if use_dense_indices else None
+    )
+
+    def run_router():
+        return fused_topk_with_score_function(
+            logits,
+            4,
+            False,
+            None,
+            None,
+            None,
+            "sigmoid",
+            expert_bias,
+            topk_indices=topk_indices,
+            qb_histogram=histogram,
+            qb_bin_bounds=bin_bounds,
+            qb_histogram_mode=histogram_mode,
+        )
+
+    run_router()
+    bounds_data_ptr = bin_bounds.data_ptr()
+    initial_bounds = bin_bounds.clone()
+
+    histogram.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        probs, routing_output = run_router()
+
+    bin_bounds.copy_(torch.tensor([-0.75, 0.25], device="cuda"))
+    assert bin_bounds.data_ptr() == bounds_data_ptr
+    histogram.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    reference = qb_topk_score_function_pytorch(
+        logits, 4, expert_bias, bin_bounds, histogram.shape[1]
+    )
+    torch.testing.assert_close(probs, reference["probs"])
+    if use_dense_indices:
+        torch.testing.assert_close(
+            topk_indices_to_routing_map(routing_output, logits.shape[1]),
+            reference["routing_map"],
+        )
+    else:
+        torch.testing.assert_close(routing_output, reference["routing_map"])
+    torch.testing.assert_close(histogram, reference["histogram"])
+    initial_reference = qb_topk_score_function_pytorch(
+        logits, 4, expert_bias, initial_bounds, histogram.shape[1]
+    )
+    assert not torch.equal(histogram, initial_reference["histogram"])
+
+
+@pytest.mark.parametrize("histogram_mode", ["two_kernel", "fused_atomic"])
+def test_qb_topk_cuda_graph_captures_bounds_update(histogram_mode):
+    logits = torch.randn(8, 16, device="cuda", dtype=torch.float32)
+    expert_bias = torch.zeros(16, device="cuda", dtype=torch.float32)
+    histogram = torch.zeros(16, 32, device="cuda", dtype=torch.int32)
+    bin_bounds = torch.tensor([-1.0, 1.0], device="cuda", dtype=torch.float32)
+    next_bounds = torch.tensor([-0.75, 0.25], device="cuda", dtype=torch.float32)
+
+    def run_iteration():
+        probs, routing_map = fused_topk_with_score_function(
+            logits,
+            4,
+            False,
+            None,
+            None,
+            None,
+            "sigmoid",
+            expert_bias,
+            qb_histogram=histogram,
+            qb_bin_bounds=bin_bounds,
+            qb_histogram_mode=histogram_mode,
+        )
+        bin_bounds.copy_(next_bounds)
+        return probs, routing_map
+
+    # Match full-iteration capture: an eager warmup ends with a bounds update, and the same
+    # update is part of the captured iteration.
+    run_iteration()
+    histogram.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        probs, routing_map = run_iteration()
+    histogram.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    reference = qb_topk_score_function_pytorch(
+        logits, 4, expert_bias, next_bounds, histogram.shape[1]
+    )
+    torch.testing.assert_close(probs, reference["probs"])
+    torch.testing.assert_close(routing_map, reference["routing_map"])
+    torch.testing.assert_close(histogram, reference["histogram"])
+    torch.testing.assert_close(bin_bounds, next_bounds)
+
+
+def test_mark_qb_bin_bounds_validated_is_deprecated():
+    bin_bounds = torch.tensor([-1.0, 1.0], device="cuda", dtype=torch.float32)
+    with pytest.warns(DeprecationWarning, match="mark_qb_bin_bounds_validated is deprecated"):
+        mark_qb_bin_bounds_validated(bin_bounds)
+
+
+@pytest.mark.parametrize(
+    "histogram_mode",
+    [QBHistogramMode.TWO_KERNEL, QBHistogramMode.FUSED_ATOMIC],
+)
+def test_qb_topk_plus_one_tie_and_bin_clamping(histogram_mode):
+    logits = torch.tensor(
+        [
+            [3.0, 3.0, 3.0, -1.0, -2.0, -3.0, -4.0, -5.0],
+            [5.0, 4.0, 3.0, 2.0, -2.0, -3.0, -4.0, -5.0],
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    _, num_experts = logits.shape
+    topk = 2
+    num_bins = 8
+    expert_bias = torch.zeros(num_experts, device="cuda", dtype=torch.float32)
+    bin_bounds = torch.tensor([-0.05, 0.05], device="cuda", dtype=torch.float32)
+    reference = qb_topk_score_function_pytorch(
+        logits,
+        topk,
+        expert_bias,
+        bin_bounds,
+        num_bins,
+    )
+    histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+
+    probs, routing_map, raw_scores, cutoff, histogram = tex.fused_topk_with_score_function_qb_fwd(
+        logits,
+        topk,
+        None,
+        expert_bias,
+        int(RoutingMapFormat.BYTEMAP),
+        None,
+        histogram,
+        bin_bounds,
+        histogram_mode,
+    )
+
+    torch.testing.assert_close(probs, reference["probs"])
+    torch.testing.assert_close(routing_map, reference["routing_map"])
+    torch.testing.assert_close(raw_scores, reference["raw_scores"])
+    torch.testing.assert_close(cutoff, reference["cutoff"])
+    torch.testing.assert_close(histogram, reference["histogram"])
+    assert histogram[:, 0].sum() > 0
+    assert histogram[:, -1].sum() > 0
+    # The first token has exactly Top-(k+1) equal scores. The deterministic
+    # compaction rule drops the largest expert ID at the cutoff.
+    assert routing_map[0, :3].tolist() == [True, True, False]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32])
@@ -331,6 +881,7 @@ def test_topk_sqrtsoftplus(
 @pytest.mark.parametrize("use_pre_softmax", [True, False])
 @pytest.mark.parametrize("group_topk", [None, 4])
 @pytest.mark.parametrize("scaling_factor", [None, 1.2])
+@pytest.mark.parametrize("topk_index_dtype", [None, torch.int16, torch.int32, torch.int64])
 def test_topk_softmax(
     dtype,
     num_tokens,
@@ -339,6 +890,7 @@ def test_topk_softmax(
     use_pre_softmax,
     group_topk,
     scaling_factor,
+    topk_index_dtype,
 ):
     num_groups = 8 if group_topk else None
     run_comparison(
@@ -352,7 +904,36 @@ def test_topk_softmax(
         scaling_factor=scaling_factor,
         score_function="softmax",
         enable_bias=False,
+        topk_output_mode="dense" if topk_index_dtype is not None else "sparse",
+        topk_index_dtype=topk_index_dtype or torch.int16,
     )
+
+
+@pytest.mark.parametrize("topk_index_dtype", [None, torch.int16])
+def test_topk_preserves_leading_dims(topk_index_dtype):
+    num_tokens = 128
+    num_experts = 32
+    topk = 4
+    logits = torch.randn(num_tokens, 2, num_experts, device="cuda", dtype=torch.float32)
+    topk_indices = None
+    if topk_index_dtype is not None:
+        topk_indices = torch.empty(num_tokens, 2, topk, device="cuda", dtype=topk_index_dtype)
+
+    probs, routing_output = fused_topk_with_score_function(
+        logits=logits,
+        topk=topk,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=None,
+        score_function="softmax",
+        expert_bias=None,
+        topk_indices=topk_indices,
+    )
+
+    assert probs.shape == logits.shape
+    expected_routing_shape = topk_indices.shape if topk_indices is not None else logits.shape
+    assert routing_output.shape == expected_routing_shape
 
 
 @pytest.mark.parametrize("dtype", [torch.float32])
@@ -414,17 +995,20 @@ def test_fused_scores_for_aux_loss(dtype, num_tokens, num_experts, topk, score_f
 @pytest.mark.parametrize("num_tokens", [2048, 7168, 14234])
 @pytest.mark.parametrize("num_experts", [1024, 256, 128, 32])
 @pytest.mark.parametrize("topk", [4, 32])
-def test_fused_moe_aux_loss(dtype, num_tokens, num_experts, topk):
+@pytest.mark.parametrize("expert_multiplier", [1, 2])
+def test_fused_moe_aux_loss(dtype, num_tokens, num_experts, topk, expert_multiplier):
     if topk >= num_experts:
         pytest.skip(f"topk ({topk}) >= num_experts ({num_experts})")
+    # Sequence aux loss batches independent sequences along the expert dimension.
+    num_cols = num_experts * expert_multiplier
     # Construct the special probs to avoid inf in the sigmoid function
     offset = torch.arange(-num_tokens // 2, num_tokens // 2, dtype=dtype, device="cuda") * 1e-4
-    probs = torch.arange(-num_experts // 2, num_experts // 2, device="cuda", dtype=dtype) * 1e-2
+    probs = torch.arange(-num_cols // 2, num_cols // 2, device="cuda", dtype=dtype) * 1e-2
     probs = probs.unsqueeze(0).repeat(num_tokens, 1) + offset.unsqueeze(1)
-    probs = probs.view(num_tokens, num_experts)
+    probs = probs.view(num_tokens, num_cols)
     probs.requires_grad = True
 
-    tokens_per_expert = torch.randint(1, 1000, (num_experts,), device="cuda", dtype=torch.int32)
+    tokens_per_expert = torch.randint(1, 1000, (num_cols,), device="cuda", dtype=torch.int32)
     coeff = 0.01
 
     probs_clone = deepcopy(probs)
@@ -448,7 +1032,7 @@ def test_fused_moe_aux_loss(dtype, num_tokens, num_experts, topk):
         coeff=coeff,
     )
 
-    atol, rtol = _get_tolerances(dtype, num_experts)
+    atol, rtol = _get_tolerances(dtype, num_cols)
     torch.testing.assert_close(aux_loss, aux_loss_fused, atol=atol, rtol=rtol)
 
     # Backward
@@ -456,6 +1040,615 @@ def test_fused_moe_aux_loss(dtype, num_tokens, num_experts, topk):
     aux_loss_fused.backward()
 
     torch.testing.assert_close(probs.grad, probs_clone.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "forward",
+        "graph_safe_forward",
+        "deterministic_forward",
+        "deterministic_graph_safe_forward",
+        "backward",
+    ],
+)
+def test_fused_moe_aux_loss_rejects_int_offset_overflow(path):
+    num_rows, num_cols = 8_388_609, 256  # Above INT_MAX elements.
+    bytes_needed = num_rows * num_cols * 2
+    torch.cuda.empty_cache()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < bytes_needed + (1 << 30):
+        pytest.skip("Needs 4.0 GiB for BF16 input/output plus 1 GiB headroom")
+
+    tokens_per_expert = torch.ones(num_cols, device="cuda", dtype=torch.int32)
+    try:
+        if path == "backward":
+            tex.fused_moe_aux_loss_bwd(
+                Const_buf=torch.ones(2, device="cuda", dtype=torch.float32),
+                tokens_per_expert=tokens_per_expert,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                grad_aux_loss=torch.ones((), device="cuda", dtype=torch.bfloat16),
+            )
+        else:
+            probs = torch.empty((num_rows, num_cols), device="cuda", dtype=torch.bfloat16)
+            arguments = dict(
+                probs=probs,
+                tokens_per_expert=tokens_per_expert,
+                num_experts=num_cols,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                topk=1,
+                coeff=0.01,
+            )
+            if path.startswith("deterministic_"):
+                arguments.update(
+                    deterministic=True,
+                    workspace=te_router._get_moe_aux_loss_workspace(probs.device),
+                )
+            if path in ("forward", "deterministic_forward"):
+                tex.fused_moe_aux_loss_fwd(total_num_tokens=num_rows, **arguments)
+            else:
+                total = torch.tensor(num_rows, device="cuda", dtype=torch.int64)
+                tex.fused_moe_aux_loss_fwd_graph_safe(total_num_tokens=total, **arguments)
+    except torch.cuda.OutOfMemoryError:
+        pytest.skip("Could not allocate the BF16 input/output tensor")
+    except RuntimeError as exc:
+        assert "num_rows * num_cols exceeds INT_MAX" in str(exc)
+    else:
+        pytest.fail("Expected the int-offset guard to reject the shape")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "forward",
+        "graph_safe_forward",
+        "deterministic_forward",
+        "deterministic_graph_safe_forward",
+        "backward",
+    ],
+)
+def test_fused_moe_aux_loss_largest_accepted_shape(path):
+    # Exactly INT_MAX elements with one column: loop counters and grid math must not overflow.
+    num_rows, num_cols = 2**31 - 1, 1
+    bytes_needed = num_rows * num_cols * 2
+    torch.cuda.empty_cache()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < bytes_needed + (1 << 30):
+        pytest.skip("Needs 4.0 GiB for BF16 input/output plus 1 GiB headroom")
+
+    tokens_per_expert = torch.ones(num_cols, device="cuda", dtype=torch.int32)
+    try:
+        if path == "backward":
+            grad_probs = tex.fused_moe_aux_loss_bwd(
+                Const_buf=torch.tensor([0.25, 0.0], device="cuda", dtype=torch.float32),
+                tokens_per_expert=tokens_per_expert,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                grad_aux_loss=torch.tensor(2.0, device="cuda", dtype=torch.bfloat16),
+            )
+            for start in range(0, num_rows, 1 << 24):
+                assert torch.all(grad_probs[start : start + (1 << 24)] == 0.5)
+        else:
+            probs = torch.zeros((num_rows, num_cols), device="cuda", dtype=torch.bfloat16)
+            probs[-2:] = 1  # Nonzero only where the row counter is closest to INT_MAX.
+            arguments = dict(
+                probs=probs,
+                tokens_per_expert=tokens_per_expert,
+                num_experts=num_cols,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                topk=1,
+                coeff=1.0,
+            )
+            if path.startswith("deterministic_"):
+                arguments.update(
+                    deterministic=True,
+                    workspace=te_router._get_moe_aux_loss_workspace(probs.device),
+                )
+            if path in ("forward", "deterministic_forward"):
+                aux_loss, _ = tex.fused_moe_aux_loss_fwd(total_num_tokens=1, **arguments)
+            else:
+                total = torch.tensor(1, device="cuda", dtype=torch.int64)
+                aux_loss, _ = tex.fused_moe_aux_loss_fwd_graph_safe(
+                    total_num_tokens=total, **arguments
+                )
+            torch.testing.assert_close(aux_loss, probs.new_tensor(2.0), atol=0, rtol=0)
+    except torch.cuda.OutOfMemoryError:
+        pytest.skip("Could not allocate the BF16 input/output tensor")
+
+
+def _moe_aux_loss_determinism_inputs(
+    dtype, num_tokens, num_experts, expert_multiplier, token_count_dtype
+):
+    """Asymmetric positive scores spanning several orders of magnitude."""
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    scores = torch.rand(
+        (num_tokens, expert_multiplier, num_experts), device="cuda", generator=generator
+    ).pow(4)
+    scores *= torch.logspace(-4, 0, num_experts, device="cuda")
+    scores /= scores.sum(dim=-1, keepdim=True)
+    probs = scores.reshape(num_tokens, -1).to(dtype).requires_grad_(True)
+    tokens_per_expert = torch.randint(
+        1, num_tokens + 1, (num_experts * expert_multiplier,), device="cuda", generator=generator
+    ).to(token_count_dtype)
+    if tokens_per_expert.is_floating_point():
+        # Global aux loss may use averaged, non-integral expert counts.
+        tokens_per_expert /= 3
+    return probs, tokens_per_expert
+
+
+def _assert_bitwise_equal(actual, expected):
+    # Compare storage bits, including for the scalar output and low-precision dtypes.
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    assert torch.equal(actual.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8))
+
+
+@pytest.mark.parametrize("tensor_total", [False, True], ids=["host_total", "tensor_total"])
+@pytest.mark.parametrize("deterministic", [None, False, True], ids=["default", "atomic", "fixed"])
+def test_fused_moe_aux_loss_deterministic_dispatch(monkeypatch, tensor_total, deterministic):
+    """Check Python dispatch and autograd argument count without launching CUDA."""
+    probs = torch.ones(3, 2, requires_grad=True)
+    tokens_per_expert = torch.tensor([1, 2], dtype=torch.int32)
+    total_num_tokens = torch.tensor(3, dtype=torch.int64) if tensor_total else 3
+    constants = torch.tensor([3.0, 4.0])
+    workspace = torch.empty(256, dtype=torch.float32)
+    calls = []
+    workspace_requests = []
+
+    def fake_workspace(device):
+        workspace_requests.append(device)
+        return workspace
+
+    def fake_forward(path, **kwargs):
+        calls.append((path, kwargs["deterministic"]))
+        assert kwargs["probs"] is probs
+        assert kwargs["num_rows"] == 3 and kwargs["num_cols"] == 2
+        assert kwargs["workspace"] is (workspace if deterministic is True else None)
+        return torch.tensor(2.0), constants
+
+    def fake_scalar_forward(**kwargs):
+        return fake_forward("host", **kwargs)
+
+    def fake_tensor_forward(**kwargs):
+        return fake_forward("tensor", **kwargs)
+
+    def fake_backward(**kwargs):
+        assert kwargs["Const_buf"] is constants
+        assert kwargs["tokens_per_expert"] is tokens_per_expert
+        return torch.full_like(probs, 7.0) * kwargs["grad_aux_loss"]
+
+    monkeypatch.setattr(tex, "fused_moe_aux_loss_fwd", fake_scalar_forward)
+    monkeypatch.setattr(tex, "fused_moe_aux_loss_fwd_graph_safe", fake_tensor_forward)
+    monkeypatch.setattr(tex, "fused_moe_aux_loss_bwd", fake_backward)
+    monkeypatch.setattr(te_router, "_get_moe_aux_loss_workspace", fake_workspace)
+    kwargs = {} if deterministic is None else {"deterministic": deterministic}
+    out = fused_moe_aux_loss(probs, tokens_per_expert, total_num_tokens, 2, 1, 0.01, **kwargs)
+    out.backward(torch.tensor(0.5))
+
+    assert calls == [("tensor" if tensor_total else "host", deterministic is True)]
+    assert workspace_requests == ([probs.device] if deterministic is True else [])
+    torch.testing.assert_close(probs.grad, torch.full_like(probs, 3.5))
+
+
+def test_fused_moe_aux_loss_workspace_reuse():
+    """Eager calls share scratch only when ordered on the same device/stream."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    shape, dtype = te_router._get_moe_aux_loss_workspace_config()
+    workspaces = []
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            workspace = te_router._get_moe_aux_loss_workspace(device)
+            again = te_router._get_moe_aux_loss_workspace(device)
+        assert workspace.data_ptr() == again.data_ptr()
+        assert workspace.device == device and workspace.dtype == dtype
+        assert tuple(workspace.shape) == shape
+        workspaces.append(workspace)
+    assert workspaces[0].data_ptr() != workspaces[1].data_ptr()
+
+
+@pytest.mark.parametrize("device_total", [False, True], ids=["host_total", "device_total"])
+@pytest.mark.parametrize(
+    "workspace_kind,match",
+    [
+        ("missing", "requires a workspace"),
+        ("empty", "must not be empty"),
+        ("undersized", "needs at least"),
+        ("wrong_dtype", "contiguous FP32"),
+        ("noncontiguous", "contiguous FP32"),
+        ("cpu", "same CUDA device"),
+    ],
+)
+def test_fused_moe_aux_loss_invalid_workspace(device_total, workspace_kind, match):
+    """Reject unsafe scratch before either forward variant launches kernels."""
+    num_tokens, num_experts = 257, 8
+    probs = torch.ones(num_tokens, num_experts, device="cuda")
+    counts = torch.ones(num_experts, dtype=torch.int32, device="cuda")
+    shape, dtype = te_router._get_moe_aux_loss_workspace_config()
+    workspace = torch.empty(shape, dtype=dtype, device="cuda")
+    if workspace_kind == "missing":
+        workspace = None
+    elif workspace_kind == "empty":
+        workspace = workspace[:0]
+    elif workspace_kind == "undersized":
+        workspace = workspace[:1]
+    elif workspace_kind == "wrong_dtype":
+        workspace = workspace.half()
+    elif workspace_kind == "noncontiguous":
+        workspace = workspace.repeat_interleave(2)[::2]
+    elif workspace_kind == "cpu":
+        workspace = torch.empty(shape, dtype=dtype)
+    total = (
+        torch.tensor(num_tokens, dtype=torch.int64, device="cuda") if device_total else num_tokens
+    )
+    forward = tex.fused_moe_aux_loss_fwd_graph_safe if device_total else tex.fused_moe_aux_loss_fwd
+    with pytest.raises(RuntimeError, match=match):
+        forward(
+            probs, counts, total, num_experts, num_tokens, num_experts, 1, 0.01, True, workspace
+        )
+
+
+def test_fused_moe_aux_loss_cuda_graph_workspace_isolation(monkeypatch):
+    """Graphs captured on one stream need private scratch for concurrent replay."""
+    num_tokens, num_experts, topk, coeff = 1025, 128, 4, 0.01
+    probs_a, counts_a = _moe_aux_loss_determinism_inputs(
+        torch.float32, num_tokens, num_experts, 1, torch.int32
+    )
+    inputs = [
+        (probs_a, counts_a, torch.tensor(num_tokens, dtype=torch.int64, device="cuda")),
+        (
+            probs_a.detach().flip((1,)).requires_grad_(True),
+            counts_a.roll(3) + 1,
+            torch.tensor(num_tokens * 2 + 1, dtype=torch.int64, device="cuda"),
+        ),
+    ]
+
+    def run(probs, counts, total):
+        out = fused_moe_aux_loss(probs, counts, total, num_experts, topk, coeff, deterministic=True)
+        (grad,) = torch.autograd.grad(out, probs)
+        return out, grad
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    expected = []
+    with torch.cuda.stream(capture_stream):
+        eager_workspace = te_router._get_moe_aux_loss_workspace(probs_a.device)
+        for args in inputs:
+            for _ in range(3):
+                warmup_out, warmup_grad = run(*args)
+            expected.append((warmup_out.detach().clone(), warmup_grad.clone()))
+        del warmup_out, warmup_grad
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    # Record addresses only, so the test does not extend scratch tensor lifetimes.
+    captured_workspace_ptrs = []
+    get_workspace = te_router._get_moe_aux_loss_workspace
+
+    def trace_workspace(device):
+        workspace = get_workspace(device)
+        if torch.cuda.is_current_stream_capturing():
+            captured_workspace_ptrs.append(workspace.data_ptr())
+        return workspace
+
+    monkeypatch.setattr(te_router, "_get_moe_aux_loss_workspace", trace_workspace)
+    graphs, captured_outputs = [], []
+    for args in inputs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            outputs = run(*args)
+        graphs.append(graph)
+        captured_outputs.append(outputs)
+    assert len(captured_workspace_ptrs) == 2
+    assert captured_workspace_ptrs[0] != captured_workspace_ptrs[1]
+    assert eager_workspace.data_ptr() not in captured_workspace_ptrs
+    with torch.cuda.stream(capture_stream):
+        assert get_workspace(probs_a.device).data_ptr() == eager_workspace.data_ptr()
+
+    replay_streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in replay_streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    for _ in range(8):
+        for stream, graph in zip(replay_streams, graphs):
+            with torch.cuda.stream(stream):
+                graph.replay()
+    for stream in replay_streams:
+        torch.cuda.current_stream().wait_stream(stream)
+
+    for (out, grad), (expected_out, expected_grad), (probs, counts, total) in zip(
+        captured_outputs, expected, inputs
+    ):
+        _assert_bitwise_equal(out, expected_out)
+        _assert_bitwise_equal(grad, expected_grad)
+        ref_probs = probs.detach().clone().requires_grad_(True)
+        ref = aux_loss_pytorch(ref_probs, counts, int(total.item()), topk, num_experts, coeff)
+        (ref_grad,) = torch.autograd.grad(ref, ref_probs)
+        torch.testing.assert_close(out, ref, atol=1e-6, rtol=2e-5)
+        torch.testing.assert_close(grad, ref_grad, atol=1e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("device_total", [False, True], ids=["host_total", "device_total"])
+@pytest.mark.parametrize(
+    "dtype,num_tokens,num_experts,expert_multiplier,token_count_dtype",
+    [
+        pytest.param(torch.float32, 4097, 128, 1, torch.int32, id="multi_cta"),
+        pytest.param(torch.float32, 257, 128, 3, torch.float32, id="sequence_global"),
+        pytest.param(torch.float32, 3, 7, 1, torch.int64, id="small_partial_count"),
+        pytest.param(torch.float32, 129, 1025, 1, torch.int32, id="wide"),
+        pytest.param(torch.float16, 4097, 128, 1, torch.int32, id="fp16"),
+        pytest.param(torch.bfloat16, 257, 128, 1, torch.bfloat16, id="bf16"),
+    ],
+)
+def test_fused_moe_aux_loss_deterministic(
+    dtype, num_tokens, num_experts, expert_multiplier, token_count_dtype, device_total
+):
+    """Each launch must produce identical loss/gradient bits on the same GPU."""
+    probs, tokens_per_expert = _moe_aux_loss_determinism_inputs(
+        dtype, num_tokens, num_experts, expert_multiplier, token_count_dtype
+    )
+    total_num_tokens = (
+        torch.tensor(num_tokens, dtype=torch.int64, device="cuda") if device_total else num_tokens
+    )
+    topk, coeff = 4, 0.01
+    grad_output = torch.tensor(0.37, dtype=dtype, device="cuda")
+
+    # Accumulate the reference in FP32, then compare in the public output dtype.
+    ref_probs = probs.detach().float().requires_grad_(True)
+    ref = aux_loss_pytorch(
+        ref_probs, tokens_per_expert.float(), num_tokens, topk, num_experts, coeff
+    )
+    (ref_grad,) = torch.autograd.grad(ref, ref_probs, grad_outputs=grad_output.float())
+    finfo = torch.finfo(dtype)
+    rtol = max(2e-5, 2 * finfo.eps)
+    atol = finfo.tiny * finfo.eps
+    expected_out = expected_grad = None
+    for _ in range(32):
+        out = fused_moe_aux_loss(
+            probs, tokens_per_expert, total_num_tokens, num_experts, topk, coeff, deterministic=True
+        )
+        (grad,) = torch.autograd.grad(out, probs, grad_outputs=grad_output)
+        if expected_out is None:
+            torch.testing.assert_close(out, ref.to(dtype), atol=atol, rtol=rtol)
+            torch.testing.assert_close(grad, ref_grad.to(dtype), atol=atol, rtol=rtol)
+            expected_out, expected_grad = out.detach().clone(), grad.clone()
+        else:
+            _assert_bitwise_equal(out, expected_out)
+            _assert_bitwise_equal(grad, expected_grad)
+
+
+@pytest.mark.parametrize("deterministic", [False, True], ids=["atomic", "fixed"])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,expert_multiplier,token_count_dtype",
+    [
+        pytest.param(4096, 128, 1, torch.int32, id="multi_cta"),
+        pytest.param(3, 7, 2, torch.float32, id="small_sequence_global"),
+    ],
+)
+def test_fused_moe_aux_loss_cuda_graph_capture(
+    num_tokens, num_experts, expert_multiplier, token_count_dtype, deterministic
+):
+    """CUDA-graph-safe path: total_num_tokens is a device tensor whose value
+    changes between replays. Forward and backward must both observe the new
+    value via the device-side coefficient computation."""
+    dtype = torch.float32
+    topk = 4
+    num_cols = num_experts * expert_multiplier
+    coeff = 0.01
+
+    probs, tokens_per_expert = _moe_aux_loss_determinism_inputs(
+        dtype, num_tokens, num_experts, expert_multiplier, token_count_dtype
+    )
+    original_probs = probs.detach().clone()
+    original_counts = tokens_per_expert.clone()
+
+    total_num_tokens_dev = torch.tensor(num_tokens, dtype=torch.int64, device="cuda")
+
+    # Warmup on a side stream to satisfy CUDA Graph capture requirements.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            warmup_out = fused_moe_aux_loss(
+                probs=probs,
+                tokens_per_expert=tokens_per_expert,
+                total_num_tokens=total_num_tokens_dev,
+                num_experts=num_experts,
+                topk=topk,
+                coeff=coeff,
+                deterministic=deterministic,
+            )
+            torch.autograd.grad(warmup_out, probs)
+        del warmup_out
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = fused_moe_aux_loss(
+            probs=probs,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_num_tokens_dev,
+            num_experts=num_experts,
+            topk=topk,
+            coeff=coeff,
+            deterministic=deterministic,
+        )
+        (grad_probs,) = torch.autograd.grad(out, probs)
+
+    atol, rtol = _get_tolerances(dtype, num_cols)
+    # Replay A -> B -> A in the same graph. Restore both inputs and the device
+    # token count so stale partial sums or coefficients cannot pass unnoticed.
+    original_out = original_grad = None
+    for changed_inputs, new_total in (
+        (False, num_tokens),
+        (True, num_tokens * 2 + 1),
+        (False, num_tokens),
+    ):
+        with torch.no_grad():
+            probs.copy_(original_probs.flip((1,)) if changed_inputs else original_probs)
+            tokens_per_expert.copy_(
+                original_counts.roll(3) + 1 if changed_inputs else original_counts
+            )
+        total_num_tokens_dev.fill_(new_total)
+        ref_probs = probs.detach().clone().requires_grad_(True)
+        ref = aux_loss_pytorch(
+            probs=ref_probs,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=new_total,
+            topk=topk,
+            num_experts=num_experts,
+            moe_aux_loss_coeff=coeff,
+        )
+        (ref_grad_probs,) = torch.autograd.grad(ref, ref_probs)
+        expected_out = expected_grad = None
+        for _ in range(16):
+            g.replay()
+            if expected_out is None or not deterministic:
+                torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+                torch.testing.assert_close(grad_probs, ref_grad_probs, atol=atol, rtol=rtol)
+                expected_out, expected_grad = out.detach().clone(), grad_probs.clone()
+            else:
+                _assert_bitwise_equal(out, expected_out)
+                _assert_bitwise_equal(grad_probs, expected_grad)
+        if deterministic and not changed_inputs:
+            if original_out is None:
+                original_out, original_grad = expected_out, expected_grad
+            else:
+                _assert_bitwise_equal(expected_out, original_out)
+                _assert_bitwise_equal(expected_grad, original_grad)
+
+
+def _bytemap_to_bitmap_u8(bytemap: torch.Tensor) -> torch.Tensor:
+    """Reference packer: bool[T, E] -> uint8[T, ceil(E/8)] LSB-first.
+
+    Matches numpy.packbits(..., bitorder='little')
+    """
+    flat = bytemap.to(torch.uint8).cpu().numpy()
+    import numpy as np
+
+    return torch.from_numpy(np.packbits(flat, axis=-1, bitorder="little")).to(bytemap.device)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,topk",
+    [(128, 32, 4), (256, 128, 8), (256, 130, 8), (128, 1024, 16)],
+)
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_topk_bitmap_vs_bytemap(dtype, num_tokens, num_experts, topk, score_function):
+    """fused_topk_with_score_function should produce identical probs and an
+    LSB-packed bitmap routing_map when routing_map_format=BITMAP_U8, and
+    backward gradients should match the bytemap path exactly."""
+    if topk >= num_experts:
+        pytest.skip(f"topk ({topk}) >= num_experts ({num_experts})")
+    if score_function in ("sigmoid", "sqrtsoftplus"):
+        offset = torch.arange(-num_tokens // 2, num_tokens // 2, dtype=dtype, device="cuda") * 1e-4
+        logits = (
+            torch.arange(-num_experts // 2, num_experts // 2, device="cuda", dtype=dtype) * 1e-2
+        )
+        logits = logits.unsqueeze(0).repeat(num_tokens, 1) + offset.unsqueeze(1)
+    else:
+        logits = (
+            torch.arange(
+                -num_tokens * num_experts // 2,
+                num_tokens * num_experts // 2,
+                device="cuda",
+                dtype=dtype,
+            )
+            * 1e-4
+        )
+        logits = logits.view(num_tokens, num_experts)
+
+    logits_byte = logits.detach().clone().requires_grad_(True)
+    logits_bit = logits.detach().clone().requires_grad_(True)
+
+    probs_byte, routing_map_byte = fused_topk_with_score_function(
+        logits=logits_byte,
+        topk=topk,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=None,
+        score_function=score_function,
+        expert_bias=None,
+        routing_map_format=RoutingMapFormat.BYTEMAP,
+    )
+    probs_bit, routing_map_bit = fused_topk_with_score_function(
+        logits=logits_bit,
+        topk=topk,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=None,
+        score_function=score_function,
+        expert_bias=None,
+        routing_map_format=RoutingMapFormat.BITMAP_U8,
+    )
+
+    assert probs_byte.dtype == probs_bit.dtype
+    torch.testing.assert_close(probs_byte, probs_bit, atol=0.0, rtol=0.0)
+
+    expected_shape = (num_tokens, (num_experts + 7) // 8)
+    assert (
+        routing_map_bit.shape == expected_shape
+    ), f"Bitmap shape {tuple(routing_map_bit.shape)} != {expected_shape}"
+    assert routing_map_bit.dtype == torch.uint8
+    assert routing_map_byte.dtype == torch.bool
+
+    packed_expected = _bytemap_to_bitmap_u8(routing_map_byte)
+    torch.testing.assert_close(routing_map_bit, packed_expected, atol=0, rtol=0)
+
+    # Backward parity: grad of probs.sum() must be bit-identical across formats.
+    probs_byte.sum().backward()
+    probs_bit.sum().backward()
+    torch.testing.assert_close(logits_byte.grad, logits_bit.grad, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,topk",
+    [(128, 32, 4), (256, 128, 8), (256, 130, 8)],
+)
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_score_for_aux_loss_bitmap_vs_bytemap(dtype, num_tokens, num_experts, topk, score_function):
+    """fused_compute_score_for_moe_aux_loss: bitmap routing_map must equal
+    LSB-packed bytemap; scores must be bit-identical across formats."""
+    if topk >= num_experts:
+        pytest.skip(f"topk ({topk}) >= num_experts ({num_experts})")
+    offset = torch.arange(-num_tokens // 2, num_tokens // 2, dtype=dtype, device="cuda") * 1e-4
+    logits = torch.arange(-num_experts // 2, num_experts // 2, device="cuda", dtype=dtype) * 1e-2
+    logits = logits.unsqueeze(0).repeat(num_tokens, 1) + offset.unsqueeze(1)
+
+    logits_byte = logits.detach().clone().requires_grad_(True)
+    logits_bit = logits.detach().clone().requires_grad_(True)
+
+    routing_map_byte, scores_byte = fused_compute_score_for_moe_aux_loss(
+        logits=logits_byte,
+        topk=topk,
+        score_function=score_function,
+        routing_map_format="bytemap",
+    )
+    routing_map_bit, scores_bit = fused_compute_score_for_moe_aux_loss(
+        logits=logits_bit,
+        topk=topk,
+        score_function=score_function,
+        routing_map_format="bitmap_u8",
+    )
+
+    torch.testing.assert_close(scores_byte, scores_bit, atol=0.0, rtol=0.0)
+
+    expected_shape = (num_tokens, (num_experts + 7) // 8)
+    assert routing_map_bit.shape == expected_shape
+    assert routing_map_bit.dtype == torch.uint8
+    assert routing_map_byte.dtype == torch.bool
+    packed_expected = _bytemap_to_bitmap_u8(routing_map_byte)
+    torch.testing.assert_close(routing_map_bit, packed_expected, atol=0, rtol=0)
+
+    # Backward parity through scores.
+    scores_byte.sum().backward()
+    scores_bit.sum().backward()
+    torch.testing.assert_close(logits_byte.grad, logits_bit.grad, atol=0.0, rtol=0.0)
 
 
 def profile_topk_softmax(
@@ -469,11 +1662,29 @@ def profile_topk_softmax(
     group_topk = 4
     scaling_factor = 1.2
     test_topk_sigmoid(
-        torch.float32, num_tokens, num_experts, topk, group_topk, scaling_factor, enable_bias
+        torch.float32,
+        num_tokens,
+        num_experts,
+        topk,
+        group_topk,
+        scaling_factor,
+        enable_bias,
     )
     test_topk_softmax(
-        torch.float32, num_tokens, num_experts, topk, use_pre_softmax, group_topk, scaling_factor
+        torch.float32,
+        num_tokens,
+        num_experts,
+        topk,
+        use_pre_softmax,
+        group_topk,
+        scaling_factor,
     )
     test_topk_sqrtsoftplus(
-        torch.float32, num_tokens, num_experts, topk, group_topk, scaling_factor, enable_bias
+        torch.float32,
+        num_tokens,
+        num_experts,
+        topk,
+        group_topk,
+        scaling_factor,
+        enable_bias,
     )

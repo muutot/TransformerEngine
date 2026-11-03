@@ -5,12 +5,13 @@
 """Linear layer forward with Userbuffers communication."""
 
 from __future__ import annotations
-from collections.abc import Iterable
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
 
 from transformer_engine_torch import CommOverlapType
+from transformer_engine.pytorch.device import te_device_type
 from ...cpp_extensions import general_gemm
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
 from ...distributed import get_distributed_world_size
@@ -23,7 +24,7 @@ from ...module.base import (
 from ...quantized_tensor import Quantizer
 from ...tensor.float8_tensor import Float8Quantizer, Float8CurrentScalingQuantizer
 from ...tensor.storage.float8_tensor_storage import Float8TensorStorage
-from .._common import maybe_dequantize, is_quantized_tensor
+from .._common import maybe_autocast_dtype, maybe_dequantize, is_quantized_tensor
 from ..basic import BasicLinear, Bias, ReduceScatter
 from ..op import (
     FusedOperation,
@@ -155,7 +156,7 @@ class UserbuffersForwardLinear(FusedOperation):
         """
 
         # Check device
-        if device.type != "cuda":
+        if device.type != te_device_type():
             raise ValueError(f"Only CUDA devices are supported (got {device})")
 
         # Check datatype
@@ -251,7 +252,9 @@ class UserbuffersForwardLinear(FusedOperation):
             extra_output=reduce_scatter_output,
         )
         if with_ub_reduce_scatter:
-            y_local = reduce_scatter_output
+            # cuBLASMp writes the reduce-scattered output directly into the GEMM
+            # output tensor; Userbuffers writes it into the extra-output buffer.
+            y_local = gemm_output if ub_comm.with_cublasmp() else reduce_scatter_output
         else:
             y_local = gemm_output
 
@@ -284,7 +287,7 @@ class UserbuffersForwardLinear(FusedOperation):
         prev_op_grad_output_quantizer: Optional[Quantizer],
         next_op_input_quantizer: Optional[Quantizer],
         basic_op_kwargs: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, Iterable[Iterable[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Sequence[Sequence[torch.Tensor]]]:
 
         # Get basic operations
         idx = self._op_idxs["linear"]
@@ -319,10 +322,7 @@ class UserbuffersForwardLinear(FusedOperation):
                 )
 
         # Get autocast dtype if needed
-        if torch.is_autocast_enabled():
-            dtype = torch.get_autocast_dtype("cuda")
-        else:
-            dtype = linear_op.weight.dtype
+        dtype = maybe_autocast_dtype(default_dtype=linear_op.weight.dtype)
 
         # Userbuffers options
         if linear_op._userbuffers_options is None:

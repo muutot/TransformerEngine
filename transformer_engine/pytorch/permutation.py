@@ -7,6 +7,7 @@ import warnings
 from typing import Optional, Tuple
 import torch
 import transformer_engine_torch as tex
+from transformer_engine.pytorch.device import te_device_type
 import transformer_engine.pytorch.triton.permutation as triton_permutation
 from transformer_engine.pytorch.constants import TE_DType
 from transformer_engine.pytorch.quantized_tensor import (
@@ -42,12 +43,16 @@ def moe_permute_index_map_forward(
     global _moe_permute_index_map_workspace, _moe_permute_index_map_max_expanded_token_num
 
     if not inp.numel():
-        return inp.clone(), torch.tensor([], device=inp.device)
+        return inp.clone(), torch.empty(0, dtype=torch.int32, device=inp.device)
 
-    if not inp.is_cuda:
-        raise ValueError(f"inp must be a CUDA tensor, but got tensor on {inp.device}.")
-    if not index.is_cuda:
-        raise ValueError(f"index must be a CUDA tensor, but got tensor on {index.device}.")
+    if inp.device.type != te_device_type():
+        raise ValueError(
+            f"inp must be a {te_device_type()} tensor, but got tensor on {inp.device}."
+        )
+    if index.device.type != te_device_type():
+        raise ValueError(
+            f"index must be a {te_device_type()} tensor, but got tensor on {index.device}."
+        )
     if inp.size(0) != index.size(0):
         raise ValueError(
             f"Permute not possible: inp.size(0) ({inp.size(0)}) must match "
@@ -98,9 +103,10 @@ def _moe_permute_index_map_fake(  # pylint: disable=unused-argument
         assert (
             num_out_tokens >= 0
         ), f"moe_permute (index map) requires num_out_tokens >= 0, got {num_out_tokens}."
-
-    # Infer output shape
-    output_tokens = num_out_tokens if num_out_tokens > 0 else num_tokens * topK
+        output_tokens = num_out_tokens if num_out_tokens > 0 else num_tokens * topK
+    else:
+        # Match `moe_permute_index_map_forward` empty-input fast path (ignores num_out_tokens).
+        output_tokens = 0
 
     # row_id_map is 1D with size = num_tokens * topK
     fake_output = torch.empty((output_tokens, inp.shape[1]), dtype=inp.dtype, device=inp.device)
@@ -290,21 +296,33 @@ def moe_permute_mask_map_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward pass for MoE permute with mask router map."""
     if not inp.numel():
-        return inp.clone(), torch.tensor([], device=inp.device), torch.tensor([], device=inp.device)
+        row_id_map = torch.empty(
+            (0, routing_map.size(1) * 2 + 1), dtype=torch.int32, device=inp.device
+        )
+        permuted_probs = torch.empty(
+            0, dtype=probs.dtype if probs is not None else torch.float32, device=inp.device
+        )
+        return inp.clone(), row_id_map, permuted_probs
 
-    if not inp.is_cuda:
-        raise ValueError(f"inp must be a CUDA tensor, but got tensor on {inp.device}.")
-    if not routing_map.is_cuda:
+    if inp.device.type != te_device_type():
         raise ValueError(
-            f"routing_map must be a CUDA tensor, but got tensor on {routing_map.device}."
+            f"inp must be a {te_device_type()} tensor, but got tensor on {inp.device}."
+        )
+    if routing_map.device.type != te_device_type():
+        raise ValueError(
+            f"routing_map must be a {te_device_type()} tensor, but got tensor on"
+            f" {routing_map.device}."
         )
     if probs is not None:
-        if not probs.is_cuda:
-            raise ValueError(f"probs must be a CUDA tensor, but got tensor on {probs.device}.")
-    if pad_offsets is not None:
-        if not pad_offsets.is_cuda:
+        if probs.device.type != te_device_type():
             raise ValueError(
-                f"pad_offsets must be a CUDA tensor, but got tensor on {pad_offsets.device}."
+                f"probs must be a {te_device_type()} tensor, but got tensor on {probs.device}."
+            )
+    if pad_offsets is not None:
+        if pad_offsets.device.type != te_device_type():
+            raise ValueError(
+                f"pad_offsets must be a {te_device_type()} tensor, but got tensor on"
+                f" {pad_offsets.device}."
             )
     if inp.size(0) != routing_map.size(0):
         raise ValueError(
@@ -318,7 +336,9 @@ def moe_permute_mask_map_forward(
     num_tokens, hidden_size = inp.size()
     num_experts = routing_map.size(1)
 
-    row_id_map = triton_permutation.make_row_id_map(routing_map, num_tokens, num_experts)
+    row_id_map = triton_permutation.make_row_id_map(
+        routing_map, num_tokens, num_experts, num_out_tokens
+    )
 
     # FP8 handling
     fp8 = isinstance(inp, QuantizedTensor)
@@ -450,11 +470,7 @@ def _moe_permute_mask_map_forward_fake(  # pylint: disable=unused-argument
         (num_tokens, num_experts * 2 + 1), dtype=torch.int32, device=inp.device
     )
     if probs is not None:
-        fake_permuted_probs = (
-            torch.empty((out_rows,), dtype=probs.dtype, device=inp.device)
-            if out_rows > 0
-            else torch.empty(0, device=inp.device)
-        )
+        fake_permuted_probs = torch.empty((out_rows,), dtype=probs.dtype, device=inp.device)
     else:
         fake_permuted_probs = torch.empty(0, device=inp.device)
     return fake_output, fake_row_id_map, fake_permuted_probs
